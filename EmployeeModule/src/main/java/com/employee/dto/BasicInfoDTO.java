@@ -62,19 +62,18 @@ public class BasicInfoDTO {
 	private Long sscNo; // SSC number - matches EmpDocuments.ssc_no (Long type)
 	private Boolean sscNotAvailable;
 	
-	// EmpPfDetails Entity fields
-	private String pfNo;
-	private Date pfJoinDate;
-	
+	// EmpPfDetails Entity fields - Only previous UAN and previous ESI numbers are stored at HR level
 	@JsonAlias({"preUanNo"})
 	private Long preUanNum; // Previous UAN No (int8 - bigint) - accepts both "preUanNum" and "preUanNo"
-	
-	private Long uanNo; // UAN No (int8 - bigint)
 	
 	@JsonAlias({"preEsiNo"})
 	private Long preEsiNum; // Previous ESI No (int8 - bigint) - accepts both "preEsiNum" and "preEsiNo"
 	
-	private Long esiNo; // ESI No (int8 - bigint)
+	// Note: PF Number, PF Join Date, UAN Number, and ESI Number are NOT stored at HR level
+	// private String pfNo;
+	// private Date pfJoinDate;
+	// private Long uanNo;
+	// private Long esiNo;
 	
 	// Working Information
 	private Integer campusId;

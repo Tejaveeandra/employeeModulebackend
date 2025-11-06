@@ -227,6 +227,7 @@ public class EmployeeService {
 		Employee employee = null;
 		try {
 			employee = prepareEmployeeEntity(onboardingDTO.getBasicInfo());
+			// Only previous UAN and previous ESI numbers are stored at HR level (not current PF/ESI/UAN)
 			EmpPfDetails empPfDetails = prepareEmpPfDetailsEntity(onboardingDTO.getBasicInfo(), employee);
 			EmpDetails empDetails = prepareEmpDetailsEntity(onboardingDTO.getBasicInfo(), onboardingDTO.getAddressInfo(), employee);
 			java.util.List<EmpaddressInfo> addressEntities = prepareAddressEntities(onboardingDTO.getAddressInfo(), employee);
@@ -241,6 +242,7 @@ public class EmployeeService {
 			employee = employeeRepository.save(employee);
 			logger.info("✅ Employee ID {} generated and consumed from sequence - proceeding with child entity saves", employee.getEmp_id());
 			
+			// Only previous UAN and previous ESI numbers are stored (not current PF/ESI/UAN)
 			if (empPfDetails != null) {
 				empPfDetails.setEmployee_id(employee);
 				empPfDetailsRepository.save(empPfDetails);
@@ -791,7 +793,7 @@ public class EmployeeService {
 		// employee.setPassout_year(0);
 		
 		if (basicInfo.getTotalExperience() != null) {
-			employee.setTotal_experience(basicInfo.getTotalExperience());
+			employee.setTotal_experience(basicInfo.getTotalExperience().doubleValue());
 		}
 		
 		employee.setIs_active(1);
@@ -888,25 +890,30 @@ public class EmployeeService {
 	
 	/**
 	 * Prepare EmpPfDetails entity WITHOUT saving
+	 * Only stores previous UAN number and previous ESI number (not current PF/ESI/UAN)
 	 */
 	private EmpPfDetails prepareEmpPfDetailsEntity(BasicInfoDTO basicInfo, Employee employee) {
 		if (basicInfo == null) return null;
 		
-		if (basicInfo.getPreUanNum() == null && basicInfo.getUanNo() == null 
-				&& basicInfo.getPreEsiNum() == null && basicInfo.getEsiNo() == null 
-				&& basicInfo.getPfNo() == null) {
+		// Only check for previous UAN and previous ESI numbers
+		if (basicInfo.getPreUanNum() == null && basicInfo.getPreEsiNum() == null) {
 			return null;
 		}
 		
 		EmpPfDetails empPfDetails = new EmpPfDetails();
-			empPfDetails.setEmployee_id(employee);
-			empPfDetails.setPf_no(basicInfo.getPfNo());
-			empPfDetails.setPf_join_date(basicInfo.getPfJoinDate());
+		empPfDetails.setEmployee_id(employee);
+		
+		// Only store previous UAN and previous ESI numbers
 		empPfDetails.setPre_uan_num(basicInfo.getPreUanNum());
-		empPfDetails.setUan_no(basicInfo.getUanNo());
 		empPfDetails.setPre_esi_num(basicInfo.getPreEsiNum());
-		empPfDetails.setEsi_no(basicInfo.getEsiNo());
-			empPfDetails.setIs_active(1);
+		
+		// Do NOT store current PF/ESI/UAN numbers at HR level
+		// empPfDetails.setPf_no(basicInfo.getPfNo());
+		// empPfDetails.setPf_join_date(basicInfo.getPfJoinDate());
+		// empPfDetails.setUan_no(basicInfo.getUanNo());
+		// empPfDetails.setEsi_no(basicInfo.getEsiNo());
+		
+		empPfDetails.setIs_active(1);
 		
 		return empPfDetails;
 	}

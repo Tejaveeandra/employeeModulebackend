@@ -8,6 +8,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
+import org.springframework.http.converter.HttpMessageNotReadableException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
 
@@ -24,6 +25,32 @@ public class GlobalExceptionHandler {
 		response.put("timestamp", LocalDateTime.now());
 		response.put("status", HttpStatus.NOT_FOUND.value());
 		return new ResponseEntity<>(response, HttpStatus.NOT_FOUND);
+	}
+	
+	@ExceptionHandler(HttpMessageNotReadableException.class)
+	public ResponseEntity<Map<String, Object>> handleHttpMessageNotReadableException(HttpMessageNotReadableException ex) {
+		logger.error("JSON parse error: {}", ex.getMessage());
+		
+		String errorMessage = ex.getMessage();
+		if (errorMessage != null && errorMessage.contains("CTRL-CHAR")) {
+			errorMessage = "Invalid JSON format: Unescaped newline or special character found. " +
+					"Please escape newlines as \\n in your JSON. " +
+					"Example: Use \"line1\\nline2\" instead of actual line breaks.";
+		} else {
+			errorMessage = "Invalid JSON format. Please check your request body syntax.";
+		}
+		
+		Map<String, Object> response = new HashMap<>();
+		response.put("message", errorMessage);
+		response.put("timestamp", LocalDateTime.now());
+		response.put("status", HttpStatus.BAD_REQUEST.value());
+		response.put("exception", "HttpMessageNotReadableException");
+		
+		if (ex.getCause() != null) {
+			response.put("cause", ex.getCause().getMessage());
+		}
+		
+		return new ResponseEntity<>(response, HttpStatus.BAD_REQUEST);
 	}
 	
 	@ExceptionHandler(Exception.class)
