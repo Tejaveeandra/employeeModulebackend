@@ -1,0 +1,106 @@
+package com.employee.entity;
+
+import java.sql.Date;
+import java.sql.Timestamp;
+
+import jakarta.persistence.Column;
+import jakarta.persistence.Entity;
+import jakarta.persistence.GeneratedValue;
+import jakarta.persistence.GenerationType;
+import jakarta.persistence.Id;
+import jakarta.persistence.JoinColumn;
+import jakarta.persistence.ManyToOne;
+import jakarta.persistence.Table;
+import jakarta.persistence.Transient;
+import lombok.AllArgsConstructor;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+
+@Data
+@AllArgsConstructor
+@NoArgsConstructor
+@Entity
+@Table(name="sce_emp_detl",schema="sce_employee")
+public class EmpDetails {
+	
+	@Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+	private int emp_detl_id;
+	
+	private String adhaar_name;
+	
+	private Date date_of_birth;
+	
+	@Column(name = "emergency_ph_no", nullable = false)
+	private String emergency_ph_no; // Required NOT NULL
+	
+	@Column(name = "personal_email")
+	private String personal_email; // Database column is personal_email (not email)
+	
+	@Column(name = "adhaar_no")
+	private String adhaar_no; // Database column is adhaar_no (not aadhar_num)
+	
+	@Column(name = "pancard_no")
+	private String pancard_no; // Database column is pancard_no (not pancard_num)
+	
+	@Column(name = "adhaar_enrolment_no")
+	private String adhaar_enrolment_no; // Database column is adhaar_enrolment_no (not adhaar_enrolment_num)
+	
+	// Note: specialization column does NOT exist in sce_emp_detl table
+	@Transient
+	private String specialization;
+	
+	 private int is_active;
+	 private String status;
+	 
+	 // Note: passout_year column does NOT exist in sce_emp_detl table
+	@Transient
+	 private int passout_year;
+	 
+	 // Audit fields - required NOT NULL columns
+	@Column(name = "created_by", nullable = false)
+	private Integer created_by = 1; // Default to 1 if not provided
+	
+	@Column(name = "created_date", nullable = false)
+	private Timestamp created_date = new Timestamp(System.currentTimeMillis());
+	
+	@Column(name = "updated_by")
+	private Integer updated_by;
+	
+	@Column(name = "updated_date")
+	private Timestamp updated_date;
+	 
+	 @ManyToOne
+     @JoinColumn(name = "emp_id")
+     private Employee employee_id;
+	 
+	 @ManyToOne
+	    @JoinColumn(name = "blood_group_id")
+	    private BloodGroup bloodGroup_id;
+	 
+	 @ManyToOne
+     @JoinColumn(name = "caste_id")
+     private Caste caste_id;
+	 
+	 @ManyToOne
+     @JoinColumn(name = "religion_id")
+     private Religion religion_id;
+	 
+	 @ManyToOne
+     @JoinColumn(name = "marital_status_id")
+     private MaritalStatus marital_status_id;
+	 
+	 // Note: emp_pf_esi_uan_info_id column does NOT exist in sce_emp_detl table
+	 // Removed relationship to prevent SQL errors
+	 // If column is added later, uncomment below:
+	 // @ManyToOne
+	 // @JoinColumn(name = "emp_pf_esi_uan_info_id")
+	 // private EmpPfDetails emp_pf_esi_uan_info_id;
+	 
+	 
+	 
+	
+	
+	
+
+}
