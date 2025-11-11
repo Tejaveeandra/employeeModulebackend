@@ -46,7 +46,6 @@ public class BankInfoDTO {
 		private String ifscCode; // From "IFSC Code"
 		private String accountNo; // From "Account No"
 		private String accountHolderName; // Required NOT NULL - Account Holder Name
-		private String payableAt; // From "Payable At"
 		// Note: BankDetails entity has: acc_type, bank_name, bank_branch, bank_holder_name, acc_no, ifsc_code
 	}
 }

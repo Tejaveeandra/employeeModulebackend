@@ -25,6 +25,10 @@ public class FamilyInfoDTO {
 	// Each member must have a relationId to identify their relationship
 	private List<FamilyMemberDTO> familyMembers;
 	
+	// Family Group Photo - uploaded file path/URL
+	// This will be saved as a document with doc_type_id = 48 (Family Group Photo)
+	private String familyGroupPhotoPath; // Optional - file path/URL after upload
+	
 	// Single reusable DTO for all family members (since they have same fields)
 	// The relationId distinguishes: Father, Mother, Spouse, Son, Daughter, etc.
 	@Data
@@ -43,6 +47,8 @@ public class FamilyInfoDTO {
 		private Integer relationId; // Required NOT NULL - Identifies relationship: Father, Mother, Spouse, Son, Daughter, etc.
 		private Date dateOfBirth; // Optional - date of birth
 		private Boolean isDependent; // Optional - is dependent (true/false)
+		private Boolean isSriChaitanyaEmp; // Optional - is Sri Chaitanya employee (true/false), defaults to false
+		private Integer parentEmpId; // Optional - parent employee ID, REQUIRED if isSriChaitanyaEmp = true
 	}
 }
 

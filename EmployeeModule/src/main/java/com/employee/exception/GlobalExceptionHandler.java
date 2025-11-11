@@ -32,12 +32,38 @@ public class GlobalExceptionHandler {
 		logger.error("JSON parse error: {}", ex.getMessage());
 		
 		String errorMessage = ex.getMessage();
+		String fieldName = null;
+		
+		// Extract field name from error message if available
+		if (ex.getCause() != null && ex.getCause().getMessage() != null) {
+			String causeMessage = ex.getCause().getMessage();
+			// Look for field name in pattern like: "through reference chain: com.employee.dto.SalaryInfoDTO[\"pfNo\"]"
+			int fieldStart = causeMessage.indexOf("[\"");
+			int fieldEnd = causeMessage.indexOf("\"]", fieldStart);
+			if (fieldStart > 0 && fieldEnd > fieldStart) {
+				fieldName = causeMessage.substring(fieldStart + 2, fieldEnd);
+			}
+		}
+		
 		if (errorMessage != null && errorMessage.contains("CTRL-CHAR")) {
-			errorMessage = "Invalid JSON format: Unescaped newline or special character found. " +
+			if (fieldName != null) {
+				errorMessage = String.format(
+					"Invalid JSON format: Unescaped newline or special character found in field '%s'. " +
 					"Please escape newlines as \\n in your JSON. " +
-					"Example: Use \"line1\\nline2\" instead of actual line breaks.";
+					"Example: Use \"line1\\nline2\" instead of actual line breaks. " +
+					"Field '%s' contains unescaped newline characters that must be escaped.",
+					fieldName, fieldName);
+			} else {
+				errorMessage = "Invalid JSON format: Unescaped newline or special character found. " +
+						"Please escape newlines as \\n in your JSON. " +
+						"Example: Use \"line1\\nline2\" instead of actual line breaks.";
+			}
 		} else {
-			errorMessage = "Invalid JSON format. Please check your request body syntax.";
+			if (fieldName != null) {
+				errorMessage = String.format("Invalid JSON format in field '%s'. Please check your request body syntax.", fieldName);
+			} else {
+				errorMessage = "Invalid JSON format. Please check your request body syntax.";
+			}
 		}
 		
 		Map<String, Object> response = new HashMap<>();
@@ -45,6 +71,10 @@ public class GlobalExceptionHandler {
 		response.put("timestamp", LocalDateTime.now());
 		response.put("status", HttpStatus.BAD_REQUEST.value());
 		response.put("exception", "HttpMessageNotReadableException");
+		
+		if (fieldName != null) {
+			response.put("field", fieldName);
+		}
 		
 		if (ex.getCause() != null) {
 			response.put("cause", ex.getCause().getMessage());

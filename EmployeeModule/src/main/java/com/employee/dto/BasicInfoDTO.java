@@ -36,7 +36,7 @@ public class BasicInfoDTO {
 	private Integer categoryId;
 	private Integer reportingManagerId;
 	private Integer empTypeId;
-	private Integer qualificationId; // Highest Qualification
+	// Note: qualificationId is NOT in DTO - it will be set automatically from qualification tab's highest qualification
 	private Integer empWorkModeId; // Working Mode
 	private Integer replacedByEmpId; // Replacement Employee
 	private Integer joinTypeId; // Joining As
@@ -59,6 +59,8 @@ public class BasicInfoDTO {
 	private Integer casteId;
 	private Integer religionId;
 	private Integer maritalStatusId;
+	private String emergencyPhNo; // Emergency contact phone number (REQUIRED NOT NULL)
+	private Integer emergencyRelationId; // Emergency contact relation ID (FK to sce_stud_relation, optional)
 	private Long sscNo; // SSC number - matches EmpDocuments.ssc_no (Long type)
 	private Boolean sscNotAvailable;
 	
@@ -85,6 +87,9 @@ public class BasicInfoDTO {
 	
 	// Audit field - passed from frontend
 	private Integer createdBy; // User ID who created the employee record
+	
+	// Temp Payroll ID - for validation against SkillTestDetl table
+	private String tempPayrollId; // Optional - validates against sce_skill_test_detl.temp_payroll_id
 	
 }
 

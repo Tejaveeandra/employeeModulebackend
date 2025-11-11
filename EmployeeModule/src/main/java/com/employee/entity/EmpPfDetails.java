@@ -29,14 +29,14 @@ public class EmpPfDetails {
 	
 	private Date pf_join_date;
 	
-	@Column(name = "pre_uan_num")
-	private Long pre_uan_num; // int8 in database - bigint
+	@Column(name = "pre_uan_no")
+	private Long pre_uan_no; // int8 in database - bigint
 	
 	@Column(name = "uan_no")
 	private Long uan_no; // int8 in database - bigint
 	
-	@Column(name = "pre_esi_num")
-	private Long pre_esi_num; // int8 in database - bigint
+	@Column(name = "pre_esi_no")
+	private Long pre_esi_no; // int8 in database - bigint
 	
 	@Column(name = "esi_no")
 	private Long esi_no; // int8 in database - bigint

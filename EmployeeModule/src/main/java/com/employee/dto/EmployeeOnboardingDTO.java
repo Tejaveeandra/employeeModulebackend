@@ -37,5 +37,8 @@ public class EmployeeOnboardingDTO {
 	
 	// Tab 8: Bank Info
 	private BankInfoDTO bankInfo;
+	
+	// Tab 9: Agreements
+	private AgreementInfoDTO agreementInfo;
 }
 

@@ -84,6 +84,9 @@ import lombok.ToString;
 	@Column(name = "emp_app_check_list_detl_id", length = 100)
 	private String emp_app_check_list_detl_id; // Optional - nullable
 	
+	@Column(name = "is_check_submit")
+	private Integer is_check_submit; // Optional - nullable (int2 - smallint, may be used as FK to sce_employee.sce_emp_level)
+	
 	@Column(name = "org_id")
 	private Integer org_id; // Optional - nullable (FK to sce_campus.sce_organization)
 	
@@ -190,11 +193,23 @@ import lombok.ToString;
 	 	@Column(name = "created_date", nullable = false)
 	 	private Timestamp created_date = new Timestamp(System.currentTimeMillis());
 	 	
-	 	@Column(name = "updated_by")
-	 	private Integer updated_by;
-	 	
-	 	@Column(name = "updated_date")
-	 	private Timestamp updated_date;
+	@Column(name = "updated_by")
+	private Integer updated_by;
+	
+	@Column(name = "updated_date")
+	private Timestamp updated_date;
+	
+	@Column(name = "remarks")
+	private String remarks; // Optional - nullable, for storing rejection/back to campus remarks
+
+	@Column(name = "agreement_org_id")
+	private Integer agreement_org_id; // Optional - nullable (FK to sce_campus.sce_organization)
+	
+	@Column(name = "aagreement_type")
+	private String agreement_type; // Optional - nullable (Note: Database column has typo "aagreement_type" with double 'a')
+	
+	@Column(name = "notice_period")
+	private String notice_period; // Optional - nullable
 
 }
 

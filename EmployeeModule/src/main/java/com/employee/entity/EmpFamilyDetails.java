@@ -60,6 +60,19 @@ public class EmpFamilyDetails {
     @JoinColumn(name = "relation_id", nullable = false)
     private Relation relation_id; // Required NOT NULL
 	
+	@Column(name = "is_sri_chaitanya_emp", nullable = false)
+	private Integer is_sri_chaitanya_emp = 0; // Required NOT NULL, default 0 (No)
+
+	@Column(name = "email")
+	private String email; // Optional - nullable
+
+	@Column(name = "contact_no")
+	private Long contact_no; // Optional - nullable (int8 in database - bigint)
+
+	@ManyToOne
+	@JoinColumn(name = "parent_emp_id")
+	private Employee parent_emp_id; // Optional - nullable, but REQUIRED if is_sri_chaitanya_emp = 1
+	
 	private int is_active; // Default 1
 	
 	// Audit fields - required NOT NULL columns

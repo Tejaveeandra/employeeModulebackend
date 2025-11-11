@@ -17,6 +17,8 @@ import lombok.NoArgsConstructor;
  * Optional Fields:
  * - ctcWords: Optional
  * - gradeId: Optional (FK to sce_emp_grade)
+ * - costCenterId: Optional (FK to sce_emp_costcenter)
+ * - orgId: Optional (FK to sce_campus.sce_organization) - updates Employee.org_id when forwarding to Central Office
  * - checkListIds: Optional (comma-separated string like "1,2,3,4,5,6,7")
  * 
  * Note: payroll_id will be automatically taken from Employee table based on tempPayrollId
@@ -39,8 +41,9 @@ public class SalaryInfoDTO {
 	
 	// New fields from DDL
 	private Integer costCenterId; // Optional - Cost Center ID (FK to sce_emp_costcenter)
-	private Integer isPfEligible; // REQUIRED - PF Eligible flag (int2, NOT NULL, default 0)
-	private Integer isEsiEligible; // REQUIRED - ESI Eligible flag (int2, NOT NULL, default 0)
+	private Integer orgId; // Optional - Organization/Company ID (FK to sce_campus.sce_organization) - updates Employee.org_id
+	private Boolean isPfEligible; // REQUIRED - PF Eligible flag (boolean, converts to 1/0 in database)
+	private Boolean isEsiEligible; // REQUIRED - ESI Eligible flag (boolean, converts to 1/0 in database)
 	
 	// PF/ESI/UAN Information (from salary service)
 	private String pfNo; // Optional - PF Number (only set if isPfEligible = 1)

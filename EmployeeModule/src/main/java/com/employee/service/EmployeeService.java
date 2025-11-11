@@ -11,6 +11,7 @@ import jakarta.persistence.EntityManager;
 import jakarta.persistence.PersistenceContext;
 
 import com.employee.dto.AddressInfoDTO;
+import com.employee.dto.AgreementInfoDTO;
 import com.employee.dto.BankInfoDTO;
 import com.employee.dto.BasicInfoDTO;
 import com.employee.dto.CategoryInfoDTO;
@@ -20,6 +21,7 @@ import com.employee.dto.FamilyInfoDTO;
 import com.employee.dto.PreviousEmployerInfoDTO;
 import com.employee.dto.QualificationDTO;
 import com.employee.entity.BankDetails;
+import com.employee.entity.EmpChequeDetails;
 import com.employee.entity.EmpaddressInfo;
 import com.employee.entity.EmpDetails;
 import com.employee.entity.EmpDocuments;
@@ -40,6 +42,7 @@ import com.employee.repository.DepartmentRepository;
 import com.employee.repository.DesignationRepository;
 import com.employee.repository.DistrictRepository;
 import com.employee.repository.EmpaddressInfoRepository;
+import com.employee.repository.EmpChequeDetailsRepository;
 import com.employee.repository.EmpDetailsRepository;
 import com.employee.repository.EmpDocTypeRepository;
 import com.employee.repository.EmpDocumentsRepository;
@@ -67,6 +70,7 @@ import com.employee.repository.OrgBankRepository;
 import com.employee.repository.OrgBankBranchRepository;
 
 import com.employee.repository.SubjectRepository;
+import com.employee.repository.SkillTestDetlRepository;
 import com.employee.entity.EmpSubject;
 import com.employee.entity.EmpPaymentType;
 import com.employee.entity.OrgBank;
@@ -176,6 +180,9 @@ public class EmployeeService {
 	private SubjectRepository subjectRepository;
 	
 	@Autowired
+	private SkillTestDetlRepository skillTestDetlRepository;
+	
+	@Autowired
 	private CampusRepository campusRepository;
 
 	@Autowired
@@ -183,7 +190,10 @@ public class EmployeeService {
 
 	@Autowired
 	private OrgBankRepository orgBankRepository;
-
+	
+	@Autowired
+	private EmpChequeDetailsRepository empChequeDetailsRepository;
+	
 	@Autowired
 	private OrgBankBranchRepository orgBankBranchRepository;
 
@@ -284,7 +294,17 @@ public class EmployeeService {
 				empDocumentsRepository.save(doc);
 			}
 			
+			// Save Family Group Photo as a document if provided
+			if (onboardingDTO.getFamilyInfo() != null && onboardingDTO.getFamilyInfo().getFamilyGroupPhotoPath() != null 
+					&& !onboardingDTO.getFamilyInfo().getFamilyGroupPhotoPath().trim().isEmpty()) {
+				EmpDocuments familyPhotoDoc = createFamilyGroupPhotoDocument(onboardingDTO.getFamilyInfo().getFamilyGroupPhotoPath(), employee);
+				empDocumentsRepository.save(familyPhotoDoc);
+				logger.info("✅ Family Group Photo saved as document for Employee ID: {}", employee.getEmp_id());
+			}
+			
 			if (onboardingDTO.getQualification() != null && onboardingDTO.getQualification().getQualifications() != null) {
+				// Note: Validation for isHighest already done in validateOnboardingData()
+				// Find the qualification marked as highest and update Employee.qualification_id
 				Integer highestQualificationId = null;
 				for (QualificationDTO.QualificationDetailsDTO qualDTO : onboardingDTO.getQualification().getQualifications()) {
 					if (Boolean.TRUE.equals(qualDTO.getIsHighest())) {
@@ -317,6 +337,12 @@ public class EmployeeService {
 				bankDetailsRepository.save(bank);
 			}
 			
+			employeeRepository.save(employee);
+			
+			// Save Agreement Info and Cheque Details (after employee is saved to get emp_id)
+			saveAgreementInfo(onboardingDTO.getAgreementInfo(), employee);
+			
+			// Save employee again to persist agreement fields
 			employeeRepository.save(employee);
 			
 			if (onboardingDTO.getBasicInfo() != null) {
@@ -535,13 +561,13 @@ public class EmployeeService {
 		}
 
 		if (basicInfo.getReplacedByEmpId() != null && basicInfo.getReplacedByEmpId() > 0) {
-			employeeRepository.findByIdAndIs_active(basicInfo.getReplacedByEmpId(), 1)
-				.orElseThrow(() -> new ResourceNotFoundException("Active Replaced By Employee not found with ID: " + basicInfo.getReplacedByEmpId()));
+			employeeRepository.findByIdAndIs_active(basicInfo.getReplacedByEmpId(), 0)
+				.orElseThrow(() -> new ResourceNotFoundException("Inactive Replacement Employee not found with ID: " + basicInfo.getReplacedByEmpId() + ". Only inactive employees (is_active = 0) can be used as replacement."));
 		}
 
 		if (basicInfo.getCampusId() != null && basicInfo.getCampusId() > 0) {
-			campusRepository.findById(basicInfo.getCampusId())
-				.orElseThrow(() -> new ResourceNotFoundException("Campus not found with ID: " + basicInfo.getCampusId()));
+			campusRepository.findByCampusIdAndIsActive(basicInfo.getCampusId(), 1)
+				.orElseThrow(() -> new ResourceNotFoundException("Active Campus not found with ID: " + basicInfo.getCampusId()));
 		}
 
 		if (basicInfo.getEmpTypeId() != null) {
@@ -549,10 +575,7 @@ public class EmployeeService {
 				.orElseThrow(() -> new ResourceNotFoundException("Employee Type not found with ID: " + basicInfo.getEmpTypeId()));
 		}
 
-		if (basicInfo.getQualificationId() != null) {
-			qualificationRepository.findById(basicInfo.getQualificationId())
-				.orElseThrow(() -> new ResourceNotFoundException("Qualification not found with ID: " + basicInfo.getQualificationId()));
-		}
+		// Note: qualificationId is NOT in basicInfo DTO - it will be set automatically from qualification tab's highest qualification
 
 		if (basicInfo.getEmpWorkModeId() != null) {
 			workingModeRepository.findById(basicInfo.getEmpWorkModeId())
@@ -562,11 +585,25 @@ public class EmployeeService {
 		if (basicInfo.getJoinTypeId() != null) {
 			joiningAsRepository.findById(basicInfo.getJoinTypeId())
 				.orElseThrow(() -> new ResourceNotFoundException("Join Type not found with ID: " + basicInfo.getJoinTypeId()));
+			
+			// If joinTypeId = 3 (Replacement), replacedByEmpId is MANDATORY
+			if (basicInfo.getJoinTypeId() == 3) {
+				if (basicInfo.getReplacedByEmpId() == null || basicInfo.getReplacedByEmpId() <= 0) {
+					throw new ResourceNotFoundException(
+							"replacedByEmpId is required when joinTypeId is 3 (Replacement). Please provide a valid replacement employee ID.");
+				}
+			}
 		}
 
 		if (basicInfo.getModeOfHiringId() != null) {
 			modeOfHiringRepository.findById(basicInfo.getModeOfHiringId())
 				.orElseThrow(() -> new ResourceNotFoundException("Mode of Hiring not found with ID: " + basicInfo.getModeOfHiringId()));
+		}
+
+		// Validate tempPayrollId against SkillTestDetl table if provided
+		if (basicInfo.getTempPayrollId() != null && !basicInfo.getTempPayrollId().trim().isEmpty()) {
+			skillTestDetlRepository.findByTempPayrollId(basicInfo.getTempPayrollId())
+				.orElseThrow(() -> new ResourceNotFoundException("Temp Payroll ID not found in Skill Test Details: " + basicInfo.getTempPayrollId() + ". Please provide a valid temp payroll ID."));
 		}
 
 		if (onboardingDTO.getAddressInfo() != null) {
@@ -602,6 +639,14 @@ public class EmployeeService {
 				countryRepository.findById(addressInfo.getPermanentAddress().getCountryId())
 					.orElseThrow(() -> new ResourceNotFoundException("Permanent Address Country not found with ID: " + addressInfo.getPermanentAddress().getCountryId()));
 			}
+		}
+
+		// Validate Family Group Photo document type if provided
+		if (onboardingDTO.getFamilyInfo() != null && onboardingDTO.getFamilyInfo().getFamilyGroupPhotoPath() != null 
+				&& !onboardingDTO.getFamilyInfo().getFamilyGroupPhotoPath().trim().isEmpty()) {
+			// Validate that Family Group Photo document type exists by name
+			empDocTypeRepository.findByDocNameAndIsActive("Family Group Photo", 1)
+				.orElseThrow(() -> new ResourceNotFoundException("Family Group Photo document type not found or inactive in document type master. Please ensure the document type is configured and active."));
 		}
 
 		if (onboardingDTO.getFamilyInfo() != null && onboardingDTO.getFamilyInfo().getFamilyMembers() != null) {
@@ -664,6 +709,16 @@ public class EmployeeService {
 		}
 
 		if (onboardingDTO.getQualification() != null && onboardingDTO.getQualification().getQualifications() != null) {
+			// Validate: Only ONE qualification should have isHighest = true
+			long highestCount = onboardingDTO.getQualification().getQualifications().stream()
+					.filter(qual -> qual != null && Boolean.TRUE.equals(qual.getIsHighest()))
+					.count();
+			
+			if (highestCount > 1) {
+				throw new IllegalArgumentException(
+						"Only one qualification can be marked as highest. Found " + highestCount + " qualifications with isHighest = true.");
+			}
+			
 			for (QualificationDTO.QualificationDetailsDTO qual : onboardingDTO.getQualification().getQualifications()) {
 				if (qual == null) continue;
 				
@@ -799,14 +854,19 @@ public class EmployeeService {
 		employee.setIs_active(1);
 		employee.setStatus("ACTIVE");
 
+		// Set tempPayrollId if provided (validated in validateOnboardingData)
+		if (basicInfo.getTempPayrollId() != null && !basicInfo.getTempPayrollId().trim().isEmpty()) {
+			employee.setTemp_payroll_id(basicInfo.getTempPayrollId());
+		}
+
 		if (basicInfo.getCreatedBy() != null && basicInfo.getCreatedBy() > 0) {
 			employee.setCreated_by(basicInfo.getCreatedBy());
 		} else {
 			employee.setCreated_by(1);
 		}
 		if (basicInfo.getCampusId() != null) {
-			employee.setCampus_id(campusRepository.findById(basicInfo.getCampusId())
-					.orElseThrow(() -> new ResourceNotFoundException("Campus not found with ID: " + basicInfo.getCampusId())));
+			employee.setCampus_id(campusRepository.findByCampusIdAndIsActive(basicInfo.getCampusId(), 1)
+					.orElseThrow(() -> new ResourceNotFoundException("Active Campus not found with ID: " + basicInfo.getCampusId())));
 		}
 
 		if (basicInfo.getGenderId() != null) {
@@ -837,6 +897,14 @@ public class EmployeeService {
 			employee.setJoin_type_id(joiningAsRepository.findByIdAndIsActive(basicInfo.getJoinTypeId(), 1)
 					.orElseThrow(() -> new ResourceNotFoundException("Active JoiningAs not found")));
 			
+			// If joinTypeId = 3 (Replacement), replacedByEmpId is MANDATORY
+			if (basicInfo.getJoinTypeId() == 3) {
+				if (basicInfo.getReplacedByEmpId() == null || basicInfo.getReplacedByEmpId() <= 0) {
+					throw new ResourceNotFoundException(
+							"replacedByEmpId is required when joinTypeId is 3 (Replacement). Please provide a valid replacement employee ID.");
+				}
+			}
+			
 			if (basicInfo.getJoinTypeId() == 4) {
 				if (basicInfo.getContractStartDate() != null) {
 					employee.setContract_start_date(basicInfo.getContractStartDate());
@@ -860,6 +928,9 @@ public class EmployeeService {
 					.orElseThrow(() -> new ResourceNotFoundException("Active ModeOfHiring not found")));
 		}
 		
+		// Note: qualification_id is NOT set from basicInfo - it will be set automatically from qualification tab's highest qualification
+		// See lines 287-302 where it's set based on isHighest flag
+		
 		employee.setEmp_check_list_status_id(employeeCheckListStatusRepository.findById(2)
 				.orElseThrow(() -> new ResourceNotFoundException("EmployeeCheckListStatus with ID 2 not found")));
 		if (basicInfo.getReferenceEmpId() != null) {
@@ -878,11 +949,27 @@ public class EmployeeService {
 			employee.setEmployee_reporting_id(employeeRepository.findByIdAndIs_active(basicInfo.getReportingManagerId(), 1)
 					.orElseThrow(() -> new ResourceNotFoundException("Active Reporting Manager not found with ID: " + basicInfo.getReportingManagerId())));
 		}
-		if (basicInfo.getReplacedByEmpId() != null && basicInfo.getReplacedByEmpId() > 0) {
-			employee.setEmployee_replaceby_id(employeeRepository.findByIdAndIs_active(basicInfo.getReplacedByEmpId(), 1)
-					.orElse(null));
+		// Handle replacedByEmpId - mandatory if joinTypeId = 3, optional otherwise
+		// Only inactive employees (is_active = 0) can be used as replacement
+		if (basicInfo.getJoinTypeId() != null && basicInfo.getJoinTypeId() == 3) {
+			// For joinTypeId = 3 (Replacement), replacedByEmpId is MANDATORY
+			if (basicInfo.getReplacedByEmpId() == null || basicInfo.getReplacedByEmpId() <= 0) {
+				throw new ResourceNotFoundException(
+						"replacedByEmpId is required when joinTypeId is 3 (Replacement). Please provide a valid replacement employee ID.");
+			}
+			employee.setEmployee_replaceby_id(employeeRepository.findByIdAndIs_active(basicInfo.getReplacedByEmpId(), 0)
+					.orElseThrow(() -> new ResourceNotFoundException(
+							"Inactive Replacement Employee not found with ID: " + basicInfo.getReplacedByEmpId() + 
+							". Only inactive employees (is_active = 0) can be used as replacement when joinTypeId is 3 (Replacement).")));
 		} else {
-			employee.setEmployee_replaceby_id(null);
+			// For other join types, replacedByEmpId is optional
+			// Only inactive employees (is_active = 0) can be used as replacement
+			if (basicInfo.getReplacedByEmpId() != null && basicInfo.getReplacedByEmpId() > 0) {
+				employee.setEmployee_replaceby_id(employeeRepository.findByIdAndIs_active(basicInfo.getReplacedByEmpId(), 0)
+						.orElse(null));
+			} else {
+				employee.setEmployee_replaceby_id(null);
+			}
 		}
 
 		return employee;
@@ -904,8 +991,8 @@ public class EmployeeService {
 		empPfDetails.setEmployee_id(employee);
 		
 		// Only store previous UAN and previous ESI numbers
-		empPfDetails.setPre_uan_num(basicInfo.getPreUanNum());
-		empPfDetails.setPre_esi_num(basicInfo.getPreEsiNum());
+		empPfDetails.setPre_uan_no(basicInfo.getPreUanNum());
+		empPfDetails.setPre_esi_no(basicInfo.getPreEsiNum());
 		
 		// Do NOT store current PF/ESI/UAN numbers at HR level
 		// empPfDetails.setPf_no(basicInfo.getPfNo());
@@ -932,13 +1019,19 @@ public class EmployeeService {
 		empDetails.setDate_of_birth(basicInfo.getDateOfBirth());
 		empDetails.setPersonal_email(basicInfo.getEmail());
 		
-		String emergencyPhNo = "";
-		if (addressInfo != null && addressInfo.getCurrentAddress() != null 
-				&& addressInfo.getCurrentAddress().getPhoneNumber() != null 
-				&& !addressInfo.getCurrentAddress().getPhoneNumber().trim().isEmpty()) {
-			emergencyPhNo = addressInfo.getCurrentAddress().getPhoneNumber().trim();
+		// Set emergency contact phone number from basicInfo (REQUIRED NOT NULL)
+		if (basicInfo.getEmergencyPhNo() == null || basicInfo.getEmergencyPhNo().trim().isEmpty()) {
+			throw new ResourceNotFoundException("Emergency contact phone number (emergencyPhNo) is required (NOT NULL column)");
 		}
-		empDetails.setEmergency_ph_no(emergencyPhNo);
+		empDetails.setEmergency_ph_no(basicInfo.getEmergencyPhNo().trim());
+		
+		// Set emergency contact relation ID from basicInfo (optional)
+		if (basicInfo.getEmergencyRelationId() != null && basicInfo.getEmergencyRelationId() > 0) {
+			empDetails.setRelation_id(relationRepository.findById(basicInfo.getEmergencyRelationId())
+					.orElseThrow(() -> new ResourceNotFoundException("Emergency Relation not found with ID: " + basicInfo.getEmergencyRelationId())));
+		} else {
+			empDetails.setRelation_id(null); // Optional - can be null
+		}
 		empDetails.setAdhaar_no(basicInfo.getAadharNum());
 		empDetails.setPancard_no(basicInfo.getPancardNum());
 		empDetails.setAdhaar_enrolment_no(basicInfo.getAadharEnrolmentNum());
@@ -1191,7 +1284,14 @@ public class EmployeeService {
 		EmpDocuments doc = new EmpDocuments();
 		doc.setEmp_id(employee);
 		doc.setDoc_path(docDTO.getDocPath());
-		doc.setSsc_no(docDTO.getSscNo());
+		
+		// Set ssc_no ONLY if doc_type_id = 1 (SSC document type)
+		if (docDTO.getDocTypeId() != null && docDTO.getDocTypeId() == 1) {
+			doc.setSsc_no(docDTO.getSscNo());
+		} else {
+			doc.setSsc_no(null); // Don't save ssc_no for other document types
+		}
+		
 		doc.setIs_verified(docDTO.getIsVerified() != null && docDTO.getIsVerified() ? 1 : 0);
 		doc.setIs_active(1);
 		
@@ -1201,6 +1301,25 @@ public class EmployeeService {
 		} else {
 			throw new ResourceNotFoundException("Document Type ID is required (NOT NULL column)");
 		}
+		
+		return doc;
+	}
+	
+	/**
+	 * Helper method to create Family Group Photo document entity
+	 * Family Group Photo is found by document name "Family Group Photo"
+	 */
+	private EmpDocuments createFamilyGroupPhotoDocument(String familyGroupPhotoPath, Employee employee) {
+		EmpDocuments doc = new EmpDocuments();
+		doc.setEmp_id(employee);
+		doc.setDoc_path(familyGroupPhotoPath);
+		doc.setSsc_no(null); // Family Group Photo doesn't have SSC number
+		doc.setIs_verified(0); // Default: not verified, HR will verify later
+		doc.setIs_active(1);
+		
+		// Set document type to Family Group Photo by name (doc_name = "Family Group Photo")
+		doc.setEmp_doc_type_id(empDocTypeRepository.findByDocNameAndIsActive("Family Group Photo", 1)
+				.orElseThrow(() -> new ResourceNotFoundException("Family Group Photo document type not found or inactive in document type master")));
 		
 		return doc;
 	}
@@ -1246,7 +1365,7 @@ public class EmployeeService {
 				throw new ResourceNotFoundException("IFSC Code is required (NOT NULL column)");
 			}
 			
-			personalAccount.setNetPayable(0.0f);
+			personalAccount.setNetPayable(null);
 			personalAccount.setIsActive(1);
 			bankList.add(personalAccount);
 		}
@@ -1263,8 +1382,6 @@ public class EmployeeService {
 				if (orgBankBranch.getBranch_name() != null && !orgBankBranch.getBranch_name().trim().isEmpty()) {
 					salaryAccount.setBankBranch(orgBankBranch.getBranch_name());
 				}
-			} else if (bankInfo.getSalaryAccount().getPayableAt() != null && !bankInfo.getSalaryAccount().getPayableAt().trim().isEmpty()) {
-				salaryAccount.setBankBranch(bankInfo.getSalaryAccount().getPayableAt());
 			}
 			
 			salaryAccount.setEmpPaymentType(paymentType);
@@ -1310,7 +1427,7 @@ public class EmployeeService {
 				throw new ResourceNotFoundException("Account number is required (NOT NULL column)");
 			}
 			
-			salaryAccount.setNetPayable(0.0f);
+			salaryAccount.setNetPayable(null);
 			salaryAccount.setIsActive(1);
 			bankList.add(salaryAccount);
 		}
@@ -1635,6 +1752,48 @@ public class EmployeeService {
 			throw new ResourceNotFoundException("BloodGroup ID is required (NOT NULL column)");
 		}
 
+		// Set is_sri_chaitanya_emp (required NOT NULL, use value from DTO or default to 0 = No)
+		Integer isSriChaitanyaEmpValue = 0;
+		if (memberDTO.getIsSriChaitanyaEmp() != null) {
+			isSriChaitanyaEmpValue = memberDTO.getIsSriChaitanyaEmp() ? 1 : 0;
+		}
+		familyMember.setIs_sri_chaitanya_emp(isSriChaitanyaEmpValue);
+		
+		// If is_sri_chaitanya_emp is true, parent_emp_id is MANDATORY
+		if (isSriChaitanyaEmpValue == 1) {
+			if (memberDTO.getParentEmpId() == null || memberDTO.getParentEmpId() <= 0) {
+				throw new ResourceNotFoundException(
+						"parentEmpId is required when isSriChaitanyaEmp is true. Please provide a valid parent employee ID.");
+			}
+			// Find and set parent employee
+			Employee parentEmployee = employeeRepository.findById(memberDTO.getParentEmpId())
+					.orElseThrow(() -> new ResourceNotFoundException(
+							"Parent Employee not found with ID: " + memberDTO.getParentEmpId() + 
+							". parentEmpId is required when isSriChaitanyaEmp is true."));
+			familyMember.setParent_emp_id(parentEmployee);
+		} else {
+			// Optional - can be null if not Sri Chaitanya employee
+			if (memberDTO.getParentEmpId() != null && memberDTO.getParentEmpId() > 0) {
+				Employee parentEmployee = employeeRepository.findById(memberDTO.getParentEmpId())
+						.orElseThrow(() -> new ResourceNotFoundException(
+								"Parent Employee not found with ID: " + memberDTO.getParentEmpId()));
+				familyMember.setParent_emp_id(parentEmployee);
+			}
+		}
+		
+		// Set email (optional)
+		familyMember.setEmail(memberDTO.getEmail());
+		
+		// Set contact_no (optional) - convert String to Long
+		if (memberDTO.getPhoneNumber() != null && !memberDTO.getPhoneNumber().trim().isEmpty()) {
+			try {
+				familyMember.setContact_no(Long.parseLong(memberDTO.getPhoneNumber()));
+			} catch (NumberFormatException e) {
+				throw new ResourceNotFoundException(
+						"Invalid contact number format. Expected numeric value, got: " + memberDTO.getPhoneNumber());
+			}
+		}
+
 		return familyMember;
 	}
 
@@ -1707,6 +1866,16 @@ public class EmployeeService {
 	private void saveQualifications(QualificationDTO qualification, Employee employee) {
 		if (qualification == null || qualification.getQualifications() == null) return;
 
+		// Validate: Only ONE qualification should have isHighest = true
+		long highestCount = qualification.getQualifications().stream()
+				.filter(qual -> Boolean.TRUE.equals(qual.getIsHighest()))
+				.count();
+		
+		if (highestCount > 1) {
+			throw new IllegalArgumentException(
+					"Only one qualification can be marked as highest. Found " + highestCount + " qualifications with isHighest = true.");
+		}
+
 		Integer highestQualificationId = null;
 
 		for (QualificationDTO.QualificationDetailsDTO qualDTO : qualification.getQualifications()) {
@@ -1755,7 +1924,14 @@ public class EmployeeService {
 			doc.setEmp_id(employee);
 			
 			doc.setDoc_path(docDTO.getDocPath());
-			doc.setSsc_no(docDTO.getSscNo());
+			
+			// Set ssc_no ONLY if doc_type_id = 1 (SSC document type)
+			if (docDTO.getDocTypeId() != null && docDTO.getDocTypeId() == 1) {
+				doc.setSsc_no(docDTO.getSscNo());
+			} else {
+				doc.setSsc_no(null); // Don't save ssc_no for other document types
+			}
+			
 			doc.setIs_verified(docDTO.getIsVerified() != null && docDTO.getIsVerified() ? 1 : 0);
 			doc.setIs_active(1);
 
@@ -1844,7 +2020,7 @@ public class EmployeeService {
 				throw new ResourceNotFoundException("IFSC Code is required (NOT NULL column)");
 			}
 			
-			personalAccount.setNetPayable(0.0f);
+			personalAccount.setNetPayable(null);
 			personalAccount.setIsActive(1);
 			bankDetailsRepository.save(personalAccount);
 		}
@@ -1861,8 +2037,6 @@ public class EmployeeService {
 				if (orgBankBranch.getBranch_name() != null && !orgBankBranch.getBranch_name().trim().isEmpty()) {
 					salaryAccount.setBankBranch(orgBankBranch.getBranch_name());
 				}
-			} else if (bankInfo.getSalaryAccount().getPayableAt() != null && !bankInfo.getSalaryAccount().getPayableAt().trim().isEmpty()) {
-			salaryAccount.setBankBranch(bankInfo.getSalaryAccount().getPayableAt());
 			}
 			
 			salaryAccount.setEmpPaymentType(paymentType);
@@ -1908,9 +2082,84 @@ public class EmployeeService {
 				throw new ResourceNotFoundException("Account number is required (NOT NULL column)");
 			}
 			
-			salaryAccount.setNetPayable(0.0f);
+			salaryAccount.setNetPayable(null);
 			salaryAccount.setIsActive(1);
 			bankDetailsRepository.save(salaryAccount);
+		}
+	}
+
+	/**
+	 * Save Agreement Information and Cheque Details
+	 * Agreement info (agreement_org_id, agreement_type, provided_cheque) is stored in Employee table
+	 * Cheque details are stored in EmpChequeDetails table (only if provided_cheque = true)
+	 */
+	private void saveAgreementInfo(AgreementInfoDTO agreementInfo, Employee employee) {
+		if (agreementInfo == null) return;
+		
+		// Set agreement information in Employee entity
+		if (agreementInfo.getAgreementOrgId() != null) {
+			employee.setAgreement_org_id(agreementInfo.getAgreementOrgId());
+		}
+		
+		if (agreementInfo.getAgreementType() != null && !agreementInfo.getAgreementType().trim().isEmpty()) {
+			employee.setAgreement_type(agreementInfo.getAgreementType());
+		}
+		
+		// Set is_check_submit from frontend (passed directly from checkbox, not derived from providedCheque)
+		// Store in Employee.is_check_submit field (OIS Check Submit)
+		// Value: 1 = checked, 0 = unchecked, null = not provided (keeps existing value)
+		if (agreementInfo.getIsCheckSubmit() != null) {
+			employee.setIs_check_submit(agreementInfo.getIsCheckSubmit());
+			logger.info("Updated is_check_submit (OIS Check Submit) for employee (emp_id: {}): {}", 
+					employee.getEmp_id(), agreementInfo.getIsCheckSubmit());
+		} else {
+			logger.debug("is_check_submit not provided in AgreementInfoDTO, keeping existing value for employee (emp_id: {})", 
+					employee.getEmp_id());
+		}
+		
+		// Save cheque details only if provided_cheque is true
+		// Supports multiple cheques - each cheque in the list creates a separate EmpChequeDetails record
+		if (Boolean.TRUE.equals(agreementInfo.getProvidedCheque()) 
+				&& agreementInfo.getChequeDetails() != null 
+				&& !agreementInfo.getChequeDetails().isEmpty()) {
+			
+			// Loop through all cheques and save each one as a separate record
+			for (AgreementInfoDTO.ChequeDetailDTO chequeDTO : agreementInfo.getChequeDetails()) {
+				if (chequeDTO == null) continue;
+				
+				EmpChequeDetails cheque = new EmpChequeDetails();
+				cheque.setEmpId(employee);
+				
+				if (chequeDTO.getChequeNo() == null) {
+					throw new ResourceNotFoundException("Cheque Number is required (NOT NULL column)");
+				}
+				cheque.setChequeNo(chequeDTO.getChequeNo());
+				
+				if (chequeDTO.getChequeBankName() == null || chequeDTO.getChequeBankName().trim().isEmpty()) {
+					throw new ResourceNotFoundException("Cheque Bank Name is required (NOT NULL column)");
+				}
+				cheque.setChequeBankName(chequeDTO.getChequeBankName().trim());
+				
+				if (chequeDTO.getChequeBankIfscCode() == null || chequeDTO.getChequeBankIfscCode().trim().isEmpty()) {
+					throw new ResourceNotFoundException("Cheque Bank IFSC Code is required (NOT NULL column)");
+				}
+				cheque.setChequeBankIfscCode(chequeDTO.getChequeBankIfscCode().trim());
+				
+				cheque.setIsActive(1);
+				
+				// Set audit fields
+				if (employee.getCreated_by() != null) {
+					cheque.setCreatedBy(employee.getCreated_by());
+				} else {
+					cheque.setCreatedBy(1);
+				}
+				cheque.setCreatedDate(new java.sql.Timestamp(System.currentTimeMillis()));
+				
+				empChequeDetailsRepository.save(cheque);
+			}
+			
+			logger.info("✅ Saved {} cheque details for Employee ID: {}", 
+					agreementInfo.getChequeDetails().size(), employee.getEmp_id());
 		}
 	}
 }

@@ -16,6 +16,8 @@ import com.employee.entity.Campus;
 @Repository
 public interface CampusRepository extends JpaRepository<Campus, Integer>{
 	
+	Optional<Campus> findByCampusIdAndIsActive(Integer campusId, Integer isActive);
+	
 //	List<Campus> findByZoneZoneId(int zoneId);
 //	List<Campus> findByCityCityId(int cityId);
 //	

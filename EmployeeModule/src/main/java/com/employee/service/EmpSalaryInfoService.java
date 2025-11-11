@@ -9,6 +9,7 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
+import com.employee.dto.BackToCampusDTO;
 import com.employee.dto.SalaryInfoDTO;
 import com.employee.entity.BankDetails;
 import com.employee.entity.CostCenter;
@@ -25,6 +26,7 @@ import com.employee.repository.CostCenterRepository;
 import com.employee.repository.EmpGradeRepository;
 import com.employee.repository.EmpPaymentTypeRepository;
 import com.employee.repository.EmpPfDetailsRepository;
+import com.employee.repository.EmpAppCheckListDetlRepository;
 import com.employee.repository.EmpSalaryInfoRepository;
 import com.employee.repository.EmpStructureRepository;
 import com.employee.repository.EmployeeRepository;
@@ -62,15 +64,21 @@ public class EmpSalaryInfoService {
 	
 	@Autowired
 	private EmployeeCheckListStatusRepository employeeCheckListStatusRepository;
+	
+	@Autowired
+	private EmpAppCheckListDetlRepository empAppCheckListDetlRepository;
 
 	/**
-	 * Create salary info based on temp_payroll_id
+	 * Create salary info based on temp_payroll_id and forward to Central Office
 	 * Flow:
 	 * 1. Find employee by temp_payroll_id (emp_id will be fetched from Employee table)
 	 * 2. Get emp_payment_type_id from BankDetails table for that emp_id
 	 * 3. Post data to EmpSalaryInfo table with emp_id and emp_payment_type_id
-	 * 4. Update checklist in Employee table (emp_app_check_list_detl_id)
-	 * 5. Update app status to 3
+	 * 4. Save/Update PF/ESI/UAN details in EmpPfDetails table
+	 * 5. Update checklist in Employee table (emp_app_check_list_detl_id)
+	 * 6. Update org_id (Company/Organization) in Employee table (if provided)
+	 * 7. Update app status to "Forward to CO" (Forward to Central Office)
+	 * 8. Clear remarks
 	 * 
 	 * Returns DTO with all the saved data (no entity relationships to avoid circular references)
 	 */
@@ -210,21 +218,21 @@ public class EmpSalaryInfoService {
 			logger.info("cost_center_id is null (optional field)");
 		}
 		
-		// Set is_pf_eligible (required NOT NULL, default 0)
+		// Set is_pf_eligible (required NOT NULL, convert Boolean to Integer: true = 1, false = 0)
 		if (salaryInfoDTO.getIsPfEligible() != null) {
-			empSalaryInfo.setIsPfEligible(salaryInfoDTO.getIsPfEligible());
+			empSalaryInfo.setIsPfEligible(salaryInfoDTO.getIsPfEligible() ? 1 : 0);
 		} else {
-			empSalaryInfo.setIsPfEligible(0); // Default to 0 if not provided
+			empSalaryInfo.setIsPfEligible(0); // Default to 0 (false) if not provided
 		}
-		logger.info("Set is_pf_eligible: {}", empSalaryInfo.getIsPfEligible());
+		logger.info("Set is_pf_eligible: {} (from boolean: {})", empSalaryInfo.getIsPfEligible(), salaryInfoDTO.getIsPfEligible());
 		
-		// Set is_esi_eligible (required NOT NULL, default 0)
+		// Set is_esi_eligible (required NOT NULL, convert Boolean to Integer: true = 1, false = 0)
 		if (salaryInfoDTO.getIsEsiEligible() != null) {
-			empSalaryInfo.setIsEsiEligible(salaryInfoDTO.getIsEsiEligible());
+			empSalaryInfo.setIsEsiEligible(salaryInfoDTO.getIsEsiEligible() ? 1 : 0);
 		} else {
-			empSalaryInfo.setIsEsiEligible(0); // Default to 0 if not provided
+			empSalaryInfo.setIsEsiEligible(0); // Default to 0 (false) if not provided
 		}
-		logger.info("Set is_esi_eligible: {}", empSalaryInfo.getIsEsiEligible());
+		logger.info("Set is_esi_eligible: {} (from boolean: {})", empSalaryInfo.getIsEsiEligible(), salaryInfoDTO.getIsEsiEligible());
 		
 		empSalaryInfo.setIsActive(1);
 
@@ -247,74 +255,109 @@ public class EmpSalaryInfoService {
 				savedSalaryInfo.getGrade() != null ? savedSalaryInfo.getGrade().getEmpGradeId() : "null");
 
 		// Step 4.5: Update PF/ESI/UAN details in EmpPfDetails table
-		// Find existing EmpPfDetails or create new one
+		// First, verify employee exists based on temp_payroll_id (already validated above, but double-check emp_id exists)
+		if (empId == null || empId <= 0) {
+			throw new ResourceNotFoundException(
+					"Cannot update PF details: Employee not found or invalid emp_id for temp_payroll_id: '" + 
+					salaryInfoDTO.getTempPayrollId() + "'");
+		}
+		
+		// Verify employee still exists in database
+		Employee employeeForPf = employeeRepository.findById(empId)
+				.orElseThrow(() -> new ResourceNotFoundException(
+						"Cannot update PF details: Employee with emp_id: " + empId + 
+						" (temp_payroll_id: '" + salaryInfoDTO.getTempPayrollId() + "') does not exist in the system."));
+		
+		// Find existing EmpPfDetails or create new one (only if employee exists)
 		EmpPfDetails empPfDetails = empPfDetailsRepository.findByEmployeeId(empId)
 				.orElse(new EmpPfDetails());
 		
 		boolean pfDetailsNeedsSave = false;
 		
-		// If PF eligible (isPfEligible = 1), set PF number and PF join date
+		// Save PF data if provided (regardless of isPfEligible value - 0 or 1)
+		if (salaryInfoDTO.getPfNo() != null && !salaryInfoDTO.getPfNo().trim().isEmpty()) {
+			empPfDetails.setPf_no(salaryInfoDTO.getPfNo());
+			pfDetailsNeedsSave = true;
+			logger.info("Set PF number: {} for emp_id: {} (isPfEligible: {})", 
+					salaryInfoDTO.getPfNo(), empId, empSalaryInfo.getIsPfEligible());
+		}
+		if (salaryInfoDTO.getPfJoinDate() != null) {
+			empPfDetails.setPf_join_date(salaryInfoDTO.getPfJoinDate());
+			pfDetailsNeedsSave = true;
+			logger.info("Set PF join date: {} for emp_id: {} (isPfEligible: {})", 
+					salaryInfoDTO.getPfJoinDate(), empId, empSalaryInfo.getIsPfEligible());
+		}
+		
+		// Save ESI data if provided (regardless of isEsiEligible value - 0 or 1)
+		if (salaryInfoDTO.getEsiNo() != null) {
+			empPfDetails.setEsi_no(salaryInfoDTO.getEsiNo());
+			pfDetailsNeedsSave = true;
+			logger.info("Set ESI number: {} for emp_id: {} (isEsiEligible: {})", 
+					salaryInfoDTO.getEsiNo(), empId, empSalaryInfo.getIsEsiEligible());
+		}
+		
+		// Save record if PF/ESI/UAN data is provided OR if eligible (for tracking)
 		if (empSalaryInfo.getIsPfEligible() != null && empSalaryInfo.getIsPfEligible() == 1) {
-			if (salaryInfoDTO.getPfNo() != null && !salaryInfoDTO.getPfNo().trim().isEmpty()) {
-				empPfDetails.setPf_no(salaryInfoDTO.getPfNo());
-				pfDetailsNeedsSave = true;
-				logger.info("Set PF number: {} for emp_id: {} (PF eligible)", salaryInfoDTO.getPfNo(), empId);
-			}
-			if (salaryInfoDTO.getPfJoinDate() != null) {
-				empPfDetails.setPf_join_date(salaryInfoDTO.getPfJoinDate());
-				pfDetailsNeedsSave = true;
-				logger.info("Set PF join date: {} for emp_id: {} (PF eligible)", salaryInfoDTO.getPfJoinDate(), empId);
-			}
-		} else {
-			logger.info("PF not eligible (isPfEligible = {}), skipping PF number and join date", empSalaryInfo.getIsPfEligible());
+			pfDetailsNeedsSave = true; // Save record when PF eligible (even if data not provided)
 		}
-		
-		// If ESI eligible (isEsiEligible = 1), set ESI number
 		if (empSalaryInfo.getIsEsiEligible() != null && empSalaryInfo.getIsEsiEligible() == 1) {
-			if (salaryInfoDTO.getEsiNo() != null) {
-				empPfDetails.setEsi_no(salaryInfoDTO.getEsiNo());
-				pfDetailsNeedsSave = true;
-				logger.info("Set ESI number: {} for emp_id: {} (ESI eligible)", salaryInfoDTO.getEsiNo(), empId);
-			}
-		} else {
-			logger.info("ESI not eligible (isEsiEligible = {}), skipping ESI number", empSalaryInfo.getIsEsiEligible());
+			pfDetailsNeedsSave = true; // Save record when ESI eligible (even if data not provided)
 		}
 		
-		// Always set UAN number if provided (no validation)
+		// Always set UAN number if provided (no eligibility check)
 		if (salaryInfoDTO.getUanNo() != null) {
 			empPfDetails.setUan_no(salaryInfoDTO.getUanNo());
 			pfDetailsNeedsSave = true;
 			logger.info("Set UAN number: {} for emp_id: {}", salaryInfoDTO.getUanNo(), empId);
 		}
 		
-		// Save EmpPfDetails if any changes were made
+		// Save EmpPfDetails if any changes were made (only if employee exists)
 		if (pfDetailsNeedsSave) {
-			empPfDetails.setEmployee_id(employee);
+			// Use the verified employee object
+			empPfDetails.setEmployee_id(employeeForPf);
 			empPfDetails.setIs_active(1);
 			if (empPfDetails.getEmp_pf_esi_uan_info_id() == 0) {
 				// New record - set created_by
-				empPfDetails.setCreated_by(employee.getCreated_by());
+				empPfDetails.setCreated_by(employeeForPf.getCreated_by());
 			}
 			empPfDetailsRepository.save(empPfDetails);
-			logger.info("Saved/Updated PF/ESI/UAN details for emp_id: {}", empId);
+			logger.info("Saved/Updated PF/ESI/UAN details for emp_id: {} (temp_payroll_id: '{}')", 
+					empId, salaryInfoDTO.getTempPayrollId());
+		} else {
+			logger.info("No PF/ESI/UAN details to save for emp_id: {} (temp_payroll_id: '{}')", 
+					empId, salaryInfoDTO.getTempPayrollId());
 		}
 
 		// Step 5: Update checklist in Employee table (emp_app_check_list_detl_id)
 		boolean needsUpdate = false;
 		if (salaryInfoDTO.getCheckListIds() != null && !salaryInfoDTO.getCheckListIds().trim().isEmpty()) {
+			// Validate checklist IDs before saving
+			validateCheckListIds(salaryInfoDTO.getCheckListIds());
 			employee.setEmp_app_check_list_detl_id(salaryInfoDTO.getCheckListIds());
 			needsUpdate = true;
 			logger.info("Setting checklist IDs for employee (emp_id: {}): {}", empId, salaryInfoDTO.getCheckListIds());
 		}
 		
-		// Step 6: Update app status to 3 (always update, not just if current is 2)
-		EmployeeCheckListStatus status3 = employeeCheckListStatusRepository.findById(3)
-				.orElseThrow(() -> new ResourceNotFoundException("EmployeeCheckListStatus with ID 3 not found"));
-		employee.setEmp_check_list_status_id(status3);
-		needsUpdate = true;
-		logger.info("Updated employee (emp_id: {}) app status to 3", empId);
+		// Step 6: Update org_id (Company/Organization) in Employee table (if provided)
+		if (salaryInfoDTO.getOrgId() != null) {
+			employee.setOrg_id(salaryInfoDTO.getOrgId());
+			needsUpdate = true;
+			logger.info("Updated org_id (Company) for employee (emp_id: {}): {}", empId, salaryInfoDTO.getOrgId());
+		}
 		
-		// Save employee updates (checklist and status)
+		// Step 7: Update app status to "Forward to CO" (Forward to Central Office)
+		EmployeeCheckListStatus forwardToCOStatus = employeeCheckListStatusRepository.findByCheck_app_status_name("Forward to CO")
+				.orElseThrow(() -> new ResourceNotFoundException("EmployeeCheckListStatus with name 'Forward to CO' not found"));
+		employee.setEmp_check_list_status_id(forwardToCOStatus);
+		needsUpdate = true;
+		logger.info("Updated employee (emp_id: {}) app status to 'Forward to CO' (ID: {})", empId, forwardToCOStatus.getEmp_app_status_id());
+		
+		// Clear remarks when forwarding to central office (after rectification)
+		employee.setRemarks(null);
+		needsUpdate = true;
+		logger.info("Cleared remarks for employee (emp_id: {}) when forwarding to central office", empId);
+		
+		// Save employee updates (checklist, status, and cleared remarks)
 		if (needsUpdate) {
 			employeeRepository.save(employee);
 			if (salaryInfoDTO.getCheckListIds() != null && !salaryInfoDTO.getCheckListIds().trim().isEmpty()) {
@@ -364,8 +407,9 @@ public class EmpSalaryInfoService {
 		salaryInfoDTO.setEmpStructureId(empSalaryInfo.getEmpStructure() != null ? empSalaryInfo.getEmpStructure().getEmpStructureId() : null);
 		salaryInfoDTO.setGradeId(empSalaryInfo.getGrade() != null ? empSalaryInfo.getGrade().getEmpGradeId() : null);
 		salaryInfoDTO.setCostCenterId(empSalaryInfo.getCostCenter() != null ? empSalaryInfo.getCostCenter().getCostCenterId() : null);
-		salaryInfoDTO.setIsPfEligible(empSalaryInfo.getIsPfEligible());
-		salaryInfoDTO.setIsEsiEligible(empSalaryInfo.getIsEsiEligible());
+		// Convert Integer to Boolean (1 = true, 0 = false, null = false)
+		salaryInfoDTO.setIsPfEligible(empSalaryInfo.getIsPfEligible() != null && empSalaryInfo.getIsPfEligible() == 1);
+		salaryInfoDTO.setIsEsiEligible(empSalaryInfo.getIsEsiEligible() != null && empSalaryInfo.getIsEsiEligible() == 1);
 		
 		// Get PF/ESI/UAN details from EmpPfDetails
 		Optional<EmpPfDetails> empPfDetailsOpt = empPfDetailsRepository.findByEmployeeId(employee.getEmp_id());
@@ -380,6 +424,133 @@ public class EmpSalaryInfoService {
 		salaryInfoDTO.setCheckListIds(employee.getEmp_app_check_list_detl_id());
 		
 		return salaryInfoDTO;
+	}
+	
+	/**
+	 * Forward to Central Office
+	 * This is an alias/wrapper for createSalaryInfo that explicitly forwards the employee
+	 * Sets emp_app_status_id to "Forward to CO" status and clears any previous remarks
+	 */
+	public SalaryInfoDTO forwardToCentralOffice(SalaryInfoDTO salaryInfoDTO) {
+		logger.info("Forwarding employee to Central Office - temp_payroll_id: {}", salaryInfoDTO.getTempPayrollId());
+		// createSalaryInfo already handles setting status to "Forward to CO" and clearing remarks
+		return createSalaryInfo(salaryInfoDTO);
+	}
+	
+	/**
+	 * Back to Campus
+	 * Sends employee back to campus for corrections
+	 * Flow:
+	 * 1. Find employee by temp_payroll_id
+	 * 2. Set emp_app_status_id to "Back to Campus" status
+	 * 3. Save remarks (reason for sending back)
+	 * 4. Optionally update checklist IDs (capture current state similar to forward)
+	 * 
+	 * @param backToCampusDTO DTO containing tempPayrollId, remarks, and optional checkListIds
+	 * @return BackToCampusDTO with the saved data
+	 */
+	public BackToCampusDTO backToCampus(BackToCampusDTO backToCampusDTO) {
+		// Validation: Check if tempPayrollId is provided
+		if (backToCampusDTO.getTempPayrollId() == null || backToCampusDTO.getTempPayrollId().trim().isEmpty()) {
+			throw new ResourceNotFoundException("tempPayrollId is required. Please provide a valid temp_payroll_id.");
+		}
+		
+		// Validation: Check if remarks is provided
+		if (backToCampusDTO.getRemarks() == null || backToCampusDTO.getRemarks().trim().isEmpty()) {
+			throw new ResourceNotFoundException("remarks is required. Please provide a reason for sending back to campus.");
+		}
+		
+		// Validation: Check remarks length (max 250 characters)
+		if (backToCampusDTO.getRemarks().length() > 250) {
+			throw new IllegalArgumentException("remarks cannot exceed 250 characters. Current length: " + backToCampusDTO.getRemarks().length());
+		}
+		
+		logger.info("Sending employee back to campus - temp_payroll_id: {}, remarks: {}", 
+				backToCampusDTO.getTempPayrollId(), backToCampusDTO.getRemarks());
+		
+		// Step 1: Find employee by temp_payroll_id
+		Employee employee = employeeRepository.findByTemp_payroll_id(backToCampusDTO.getTempPayrollId())
+				.orElseThrow(() -> new ResourceNotFoundException(
+						"Employee not found with temp_payroll_id: '" + backToCampusDTO.getTempPayrollId() + 
+						"'. Please verify the temp_payroll_id is correct and the employee exists in the system."));
+		
+		Integer empId = employee.getEmp_id();
+		logger.info("Found employee - temp_payroll_id: {}, emp_id: {}", 
+				employee.getTemp_payroll_id(), empId);
+		
+		// Additional validation: Check if employee is active
+		if (employee.getIs_active() != 1) {
+			throw new ResourceNotFoundException(
+					"Employee with temp_payroll_id: '" + backToCampusDTO.getTempPayrollId() + 
+					"' is not active. emp_id: " + empId);
+		}
+		
+		// Step 2: Update app status to "Back to Campus"
+		EmployeeCheckListStatus backToCampusStatus = employeeCheckListStatusRepository.findByCheck_app_status_name("Back to Campus")
+				.orElseThrow(() -> new ResourceNotFoundException("EmployeeCheckListStatus with name 'Back to Campus' not found"));
+		employee.setEmp_check_list_status_id(backToCampusStatus);
+		logger.info("Updated employee (emp_id: {}) app status to 'Back to Campus' (ID: {})", empId, backToCampusStatus.getEmp_app_status_id());
+		
+		// Step 3: Save remarks
+		employee.setRemarks(backToCampusDTO.getRemarks().trim());
+		logger.info("Saved remarks for employee (emp_id: {}): {}", empId, backToCampusDTO.getRemarks());
+		
+		// Step 4: Optionally update checklist IDs (capture current state similar to forward to central office)
+		if (backToCampusDTO.getCheckListIds() != null && !backToCampusDTO.getCheckListIds().trim().isEmpty()) {
+			// Validate checklist IDs before saving
+			validateCheckListIds(backToCampusDTO.getCheckListIds());
+			employee.setEmp_app_check_list_detl_id(backToCampusDTO.getCheckListIds());
+			logger.info("Updated checklist IDs for employee (emp_id: {}): {}", empId, backToCampusDTO.getCheckListIds());
+		}
+		
+		// Save employee updates (status, remarks, and optional checklist)
+		employeeRepository.save(employee);
+		logger.info("Successfully sent employee (emp_id: {}, temp_payroll_id: '{}') back to campus with remarks", 
+				empId, backToCampusDTO.getTempPayrollId());
+		
+		// Return the DTO with saved data
+		return backToCampusDTO;
+	}
+	
+	/**
+	 * Validate checklist IDs - checks if all IDs in comma-separated string exist in EmpAppCheckListDetl table
+	 * @param checkListIds Comma-separated string of checklist IDs (e.g., "1,2,3,4,5,6,7")
+	 * @throws ResourceNotFoundException if any checklist ID is invalid or not found
+	 */
+	private void validateCheckListIds(String checkListIds) {
+		if (checkListIds == null || checkListIds.trim().isEmpty()) {
+			return; // No validation needed if empty
+		}
+		
+		// Split comma-separated string into individual IDs
+		String[] idArray = checkListIds.split(",");
+		
+		for (String idStr : idArray) {
+			idStr = idStr.trim(); // Remove whitespace
+			
+			if (idStr.isEmpty()) {
+				continue; // Skip empty strings
+			}
+			
+			try {
+				Integer checklistId = Integer.parseInt(idStr);
+				
+				// Check if checklist ID exists and is active in EmpAppCheckListDetl table
+				empAppCheckListDetlRepository.findByIdAndIsActive(checklistId, 1)
+					.orElseThrow(() -> new ResourceNotFoundException(
+							"Checklist ID " + checklistId + " not found or inactive in checklist master table. " +
+							"Please provide valid checklist IDs. Provided checklist IDs: " + checkListIds));
+				
+				logger.debug("Validated checklist ID: {} exists and is active", checklistId);
+				
+			} catch (NumberFormatException e) {
+				throw new ResourceNotFoundException(
+						"Invalid checklist ID format: '" + idStr + "'. Checklist IDs must be numeric. " +
+						"Provided checklist IDs: " + checkListIds);
+			}
+		}
+		
+		logger.info("✅ All checklist IDs validated successfully: {}", checkListIds);
 	}
 }
 

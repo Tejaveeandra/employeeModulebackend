@@ -90,6 +90,10 @@ public class EmpDetails {
      @JoinColumn(name = "marital_status_id")
      private MaritalStatus marital_status_id;
 	 
+	 @ManyToOne
+	 @JoinColumn(name = "relation_id")
+	 private Relation relation_id; // Optional - nullable (FK to sce_student.sce_stud_relation)
+	 
 	 // Note: emp_pf_esi_uan_info_id column does NOT exist in sce_emp_detl table
 	 // Removed relationship to prevent SQL errors
 	 // If column is added later, uncomment below:
