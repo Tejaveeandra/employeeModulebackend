@@ -30,6 +30,7 @@ import com.employee.entity.EmpFamilyDetails;
 import com.employee.entity.EmpPfDetails;
 import com.employee.entity.EmpQualification;
 import com.employee.entity.Employee;
+import com.employee.entity.EmployeeCheckListStatus;
 import com.employee.entity.Campus;
 import com.employee.exception.ResourceNotFoundException;
 import com.employee.repository.BloodGroupRepository;
@@ -604,6 +605,15 @@ public class EmployeeService {
 		if (basicInfo.getTempPayrollId() != null && !basicInfo.getTempPayrollId().trim().isEmpty()) {
 			skillTestDetlRepository.findByTempPayrollId(basicInfo.getTempPayrollId())
 				.orElseThrow(() -> new ResourceNotFoundException("Temp Payroll ID not found in Skill Test Details: " + basicInfo.getTempPayrollId() + ". Please provide a valid temp payroll ID."));
+			
+			// Validate that temp_payroll_id does not already exist in Employee table (prevent duplicates)
+			employeeRepository.findByTemp_payroll_id(basicInfo.getTempPayrollId().trim())
+				.ifPresent(existingEmployee -> {
+					throw new ResourceNotFoundException(
+						"Employee with temp_payroll_id '" + basicInfo.getTempPayrollId() + 
+						"' already exists in the system (emp_id: " + existingEmployee.getEmp_id() + 
+						"). Each temp_payroll_id must be unique. Please use a different temp_payroll_id.");
+				});
 		}
 
 		if (onboardingDTO.getAddressInfo() != null) {
@@ -659,10 +669,17 @@ public class EmployeeService {
 				relationRepository.findById(member.getRelationId())
 					.orElseThrow(() -> new ResourceNotFoundException("Relation not found with ID: " + member.getRelationId() + " for family member: " + member.getFirstName()));
 				
-				if (member.getGenderId() != null && member.getRelationId() != 1 && member.getRelationId() != 2) {
+				// Gender validation: For Father (relationId=1) and Mother (relationId=2), gender is auto-set by backend
+				// For other relations, genderId is required from DTO
+				if (member.getRelationId() != 1 && member.getRelationId() != 2) {
+					if (member.getGenderId() == null) {
+						throw new ResourceNotFoundException("Gender ID is required for family member: " + member.getFirstName() + 
+								" (relationId: " + member.getRelationId() + "). Gender is only auto-set for Father and Mother.");
+					}
 					genderRepository.findById(member.getGenderId())
 						.orElseThrow(() -> new ResourceNotFoundException("Gender not found with ID: " + member.getGenderId() + " for family member: " + member.getFirstName()));
 				}
+				// Note: For Father (relationId=1) and Mother (relationId=2), genderId from DTO is ignored - backend auto-sets it
 				
 				if (member.getBloodGroupId() == null) {
 					throw new ResourceNotFoundException("Blood Group ID is required for family member: " + member.getFirstName());
@@ -931,8 +948,14 @@ public class EmployeeService {
 		// Note: qualification_id is NOT set from basicInfo - it will be set automatically from qualification tab's highest qualification
 		// See lines 287-302 where it's set based on isHighest flag
 		
-		employee.setEmp_check_list_status_id(employeeCheckListStatusRepository.findById(2)
-				.orElseThrow(() -> new ResourceNotFoundException("EmployeeCheckListStatus with ID 2 not found")));
+		// IMPORTANT: Set initial app status to "Pending at DO" when employee is onboarded
+		// This is the ONLY status that should be set during onboarding - no other status is allowed
+		// All new employees must start with "Pending at DO" status
+		EmployeeCheckListStatus pendingAtDOStatus = employeeCheckListStatusRepository.findByCheck_app_status_name("Pending at DO")
+				.orElseThrow(() -> new ResourceNotFoundException("EmployeeCheckListStatus with name 'Pending at DO' not found"));
+		employee.setEmp_check_list_status_id(pendingAtDOStatus);
+		logger.info("Set initial app status to 'Pending at DO' (ID: {}) for new employee (emp_id: {}) - This is the only status allowed during onboarding", 
+				pendingAtDOStatus.getEmp_app_status_id(), employee.getEmp_id());
 		if (basicInfo.getReferenceEmpId() != null) {
 			employee.setEmployee_reference(employeeRepository.findByIdAndIs_active(basicInfo.getReferenceEmpId(), 1)
 					.orElseThrow(() -> new ResourceNotFoundException("Active Reference Employee not found with ID: " + basicInfo.getReferenceEmpId())));
@@ -1659,7 +1682,9 @@ public class EmployeeService {
 		address.setHouse_no(addressDTO.getAddressLine1());
 		address.setLandmark(addressDTO.getAddressLine2() + " " + (addressDTO.getAddressLine3() != null ? addressDTO.getAddressLine3() : ""));
 		address.setPostal_code(addressDTO.getPin());
-		address.setEmrg_contact_no(Long.parseLong(addressDTO.getPhoneNumber() != null ? addressDTO.getPhoneNumber() : "0"));
+		// Note: emrg_contact_no column does NOT exist in sce_emp_addrs table
+		// Removed to prevent SQL errors
+		// address.setEmrg_contact_no(Long.parseLong(addressDTO.getPhoneNumber() != null ? addressDTO.getPhoneNumber() : "0"));
 		address.setIs_active(1);
 		
 		address.setEmp_id(employee);
@@ -1727,10 +1752,19 @@ public class EmployeeService {
 		Integer genderIdToUse;
 		if (memberDTO.getRelationId() != null) {
 			if (memberDTO.getRelationId() == 1) {
+				// Father - gender is automatically set to Male (1), ignore genderId from DTO if sent
 				genderIdToUse = 1;
+				if (memberDTO.getGenderId() != null) {
+					logger.debug("Ignoring genderId {} from DTO for Father (relationId=1). Auto-setting to Male (1).", memberDTO.getGenderId());
+				}
 			} else if (memberDTO.getRelationId() == 2) {
+				// Mother - gender is automatically set to Female (2), ignore genderId from DTO if sent
 				genderIdToUse = 2;
+				if (memberDTO.getGenderId() != null) {
+					logger.debug("Ignoring genderId {} from DTO for Mother (relationId=2). Auto-setting to Female (2).", memberDTO.getGenderId());
+				}
 			} else {
+				// For other relations, use genderId from DTO (required)
 				genderIdToUse = memberDTO.getGenderId();
 			}
 		} else {

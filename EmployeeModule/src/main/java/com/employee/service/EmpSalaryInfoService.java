@@ -70,17 +70,26 @@ public class EmpSalaryInfoService {
 
 	/**
 	 * Create salary info based on temp_payroll_id and forward to Central Office
+	 * 
+	 * IMPORTANT: This method ONLY works when employee current status is "Pending at DO" or "Back to DO"
+	 * This allows forwarding to CO again after CO rejection (when status is "Back to DO")
+	 * If employee has any other status, this method will throw an error
+	 * 
 	 * Flow:
 	 * 1. Find employee by temp_payroll_id (emp_id will be fetched from Employee table)
-	 * 2. Get emp_payment_type_id from BankDetails table for that emp_id
-	 * 3. Post data to EmpSalaryInfo table with emp_id and emp_payment_type_id
-	 * 4. Save/Update PF/ESI/UAN details in EmpPfDetails table
-	 * 5. Update checklist in Employee table (emp_app_check_list_detl_id)
-	 * 6. Update org_id (Company/Organization) in Employee table (if provided)
-	 * 7. Update app status to "Forward to CO" (Forward to Central Office)
-	 * 8. Clear remarks
+	 * 2. Validate that current status is "Pending at DO" or "Back to DO" (required)
+	 * 3. Get emp_payment_type_id from BankDetails table for that emp_id
+	 * 4. Check if EmpSalaryInfo already exists for this emp_id:
+	 *    - If exists: Update existing record (prevents duplicates)
+	 *    - If not exists: Create new record
+	 * 5. Save/Update PF/ESI/UAN details in EmpPfDetails table
+	 * 6. Update checklist in Employee table (emp_app_check_list_detl_id)
+	 * 7. Update org_id (Company/Organization) in Employee table (if provided)
+	 * 8. Update app status to "Pending at CO" (when forwarding to Central Office)
+	 * 9. Clear remarks
 	 * 
 	 * Returns DTO with all the saved data (no entity relationships to avoid circular references)
+	 * @throws ResourceNotFoundException if employee status is not "Pending at DO" or "Back to DO"
 	 */
 	public SalaryInfoDTO createSalaryInfo(SalaryInfoDTO salaryInfoDTO) {
 		// Validation: Check if tempPayrollId is provided
@@ -117,6 +126,25 @@ public class EmpSalaryInfoService {
 					"Employee with temp_payroll_id: '" + salaryInfoDTO.getTempPayrollId() + 
 					"' is not active. emp_id: " + empId);
 		}
+		
+		// Validation: Check if current status is "Pending at DO" or "Back to DO" - forward to CO works for both statuses
+		// This allows forwarding again after CO rejection (when status is "Back to DO")
+		if (employee.getEmp_check_list_status_id() == null) {
+			throw new ResourceNotFoundException(
+					"Cannot forward employee to Central Office: Employee (emp_id: " + empId + 
+					", temp_payroll_id: '" + salaryInfoDTO.getTempPayrollId() + 
+					"') does not have a status set. This method only works when employee status is 'Pending at DO' or 'Back to DO'.");
+		}
+		
+		String currentStatusName = employee.getEmp_check_list_status_id().getCheck_app_status_name();
+		if (!"Pending at DO".equals(currentStatusName) && !"Back to DO".equals(currentStatusName)) {
+			throw new ResourceNotFoundException(
+					"Cannot forward employee to Central Office: Current employee status is '" + currentStatusName + 
+					"' (emp_id: " + empId + ", temp_payroll_id: '" + salaryInfoDTO.getTempPayrollId() + 
+					"'). This method only works when employee status is 'Pending at DO' or 'Back to DO'.");
+		}
+		
+		logger.info("Employee (emp_id: {}) current status is '{}', proceeding with forward to Central Office", empId, currentStatusName);
 
 		// Step 2: Get emp_payment_type_id from BankDetails table (where emp_id matches)
 		EmpPaymentType empPaymentType = null;
@@ -157,9 +185,21 @@ public class EmpSalaryInfoService {
 			logger.warn("No BankDetails found for emp_id: {}. emp_payment_type_id will be null.", empId);
 		}
 
-		// Step 3: Create and save EmpSalaryInfo entity
-		EmpSalaryInfo empSalaryInfo = new EmpSalaryInfo();
-		empSalaryInfo.setEmpId(employee); // Set emp_id (FK to Employee table) - fetched from Employee using temp_payroll_id
+		// Step 3: Check if EmpSalaryInfo already exists for this emp_id, if yes update, else create new
+		Optional<EmpSalaryInfo> existingSalaryInfoOpt = empSalaryInfoRepository.findByEmpIdAndIsActive(empId, 1);
+		EmpSalaryInfo empSalaryInfo;
+		
+		if (existingSalaryInfoOpt.isPresent()) {
+			// Update existing record
+			empSalaryInfo = existingSalaryInfoOpt.get();
+			logger.info("Found existing EmpSalaryInfo record (emp_sal_info_id: {}) for emp_id: {}, updating instead of creating duplicate", 
+					empSalaryInfo.getEmpSalInfoId(), empId);
+		} else {
+			// Create new record
+			empSalaryInfo = new EmpSalaryInfo();
+			empSalaryInfo.setEmpId(employee); // Set emp_id (FK to Employee table) - fetched from Employee using temp_payroll_id
+			logger.info("No existing EmpSalaryInfo found for emp_id: {}, creating new record", empId);
+		}
 		
 		// Set temp_payroll_id from Employee table (store in temp_payroll_id column)
 		if (employee.getTemp_payroll_id() != null && !employee.getTemp_payroll_id().trim().isEmpty()) {
@@ -170,9 +210,13 @@ public class EmpSalaryInfoService {
 					"' does not have temp_payroll_id set in Employee table.");
 		}
 		
-		// Set payroll_id to null (as per team's approach - will be updated later)
-		empSalaryInfo.setPayrollId(null);
-		logger.info("Setting payroll_id to null (will be updated later when available)");
+		// Set payroll_id - keep existing value if updating, or set to null if creating new
+		if (empSalaryInfo.getPayrollId() == null) {
+			empSalaryInfo.setPayrollId(null);
+			logger.info("Setting payroll_id to null (will be updated later when available)");
+		} else {
+			logger.info("Keeping existing payroll_id: {} (not overwriting)", empSalaryInfo.getPayrollId());
+		}
 		
 		// Set emp_payment_type_id from BankDetails (for that emp_id)
 		empSalaryInfo.setEmpPaymentType(empPaymentType);
@@ -234,6 +278,7 @@ public class EmpSalaryInfoService {
 		}
 		logger.info("Set is_esi_eligible: {} (from boolean: {})", empSalaryInfo.getIsEsiEligible(), salaryInfoDTO.getIsEsiEligible());
 		
+		// Set isActive to 1 (for both new and existing records)
 		empSalaryInfo.setIsActive(1);
 
 		// Step 4: Save to salary table
@@ -345,12 +390,12 @@ public class EmpSalaryInfoService {
 			logger.info("Updated org_id (Company) for employee (emp_id: {}): {}", empId, salaryInfoDTO.getOrgId());
 		}
 		
-		// Step 7: Update app status to "Forward to CO" (Forward to Central Office)
-		EmployeeCheckListStatus forwardToCOStatus = employeeCheckListStatusRepository.findByCheck_app_status_name("Forward to CO")
-				.orElseThrow(() -> new ResourceNotFoundException("EmployeeCheckListStatus with name 'Forward to CO' not found"));
-		employee.setEmp_check_list_status_id(forwardToCOStatus);
+		// Step 7: Update app status to "Pending at CO" when forwarding to Central Office
+		EmployeeCheckListStatus pendingAtCOStatus = employeeCheckListStatusRepository.findByCheck_app_status_name("Pending at CO")
+				.orElseThrow(() -> new ResourceNotFoundException("EmployeeCheckListStatus with name 'Pending at CO' not found"));
+		employee.setEmp_check_list_status_id(pendingAtCOStatus);
 		needsUpdate = true;
-		logger.info("Updated employee (emp_id: {}) app status to 'Forward to CO' (ID: {})", empId, forwardToCOStatus.getEmp_app_status_id());
+		logger.info("Updated employee (emp_id: {}) app status to 'Pending at CO' (ID: {}) when forwarding to central office", empId, pendingAtCOStatus.getEmp_app_status_id());
 		
 		// Clear remarks when forwarding to central office (after rectification)
 		employee.setRemarks(null);
@@ -429,25 +474,37 @@ public class EmpSalaryInfoService {
 	/**
 	 * Forward to Central Office
 	 * This is an alias/wrapper for createSalaryInfo that explicitly forwards the employee
-	 * Sets emp_app_status_id to "Forward to CO" status and clears any previous remarks
+	 * Sets emp_app_status_id to "Pending at CO" status and clears any previous remarks
+	 * 
+	 * IMPORTANT: This method ONLY works when employee current status is "Pending at DO" or "Back to DO"
+	 * This allows forwarding to CO again after CO rejection (when status is "Back to DO")
+	 * If employee has any other status, this method will throw an error
+	 * 
+	 * @throws ResourceNotFoundException if employee status is not "Pending at DO" or "Back to DO"
 	 */
 	public SalaryInfoDTO forwardToCentralOffice(SalaryInfoDTO salaryInfoDTO) {
 		logger.info("Forwarding employee to Central Office - temp_payroll_id: {}", salaryInfoDTO.getTempPayrollId());
-		// createSalaryInfo already handles setting status to "Forward to CO" and clearing remarks
+		// createSalaryInfo already handles setting status to "Pending at CO" and clearing remarks
 		return createSalaryInfo(salaryInfoDTO);
 	}
 	
 	/**
 	 * Back to Campus
 	 * Sends employee back to campus for corrections
+	 * 
+	 * IMPORTANT: This method ONLY works when employee current status is "Pending at DO"
+	 * If employee has any other status, this method will throw an error
+	 * 
 	 * Flow:
 	 * 1. Find employee by temp_payroll_id
-	 * 2. Set emp_app_status_id to "Back to Campus" status
-	 * 3. Save remarks (reason for sending back)
-	 * 4. Optionally update checklist IDs (capture current state similar to forward)
+	 * 2. Validate that current status is "Pending at DO" (required)
+	 * 3. Set emp_app_status_id to "Back to Campus" status
+	 * 4. Save remarks (reason for sending back)
+	 * 5. Optionally update checklist IDs (capture current state similar to forward)
 	 * 
 	 * @param backToCampusDTO DTO containing tempPayrollId, remarks, and optional checkListIds
 	 * @return BackToCampusDTO with the saved data
+	 * @throws ResourceNotFoundException if employee status is not "Pending at DO"
 	 */
 	public BackToCampusDTO backToCampus(BackToCampusDTO backToCampusDTO) {
 		// Validation: Check if tempPayrollId is provided
@@ -484,6 +541,24 @@ public class EmpSalaryInfoService {
 					"Employee with temp_payroll_id: '" + backToCampusDTO.getTempPayrollId() + 
 					"' is not active. emp_id: " + empId);
 		}
+		
+		// Validation: Check if current status is "Pending at DO" - this method only works for "Pending at DO" status
+		if (employee.getEmp_check_list_status_id() == null) {
+			throw new ResourceNotFoundException(
+					"Cannot send employee back to campus: Employee (emp_id: " + empId + 
+					", temp_payroll_id: '" + backToCampusDTO.getTempPayrollId() + 
+					"') does not have a status set. This method only works when employee status is 'Pending at DO'.");
+		}
+		
+		String currentStatusName = employee.getEmp_check_list_status_id().getCheck_app_status_name();
+		if (!"Pending at DO".equals(currentStatusName)) {
+			throw new ResourceNotFoundException(
+					"Cannot send employee back to campus: Current employee status is '" + currentStatusName + 
+					"' (emp_id: " + empId + ", temp_payroll_id: '" + backToCampusDTO.getTempPayrollId() + 
+					"'). This method only works when employee status is 'Pending at DO'.");
+		}
+		
+		logger.info("Employee (emp_id: {}) current status is 'Pending at DO', proceeding with back to campus", empId);
 		
 		// Step 2: Update app status to "Back to Campus"
 		EmployeeCheckListStatus backToCampusStatus = employeeCheckListStatusRepository.findByCheck_app_status_name("Back to Campus")

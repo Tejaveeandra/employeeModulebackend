@@ -41,7 +41,7 @@ public class EmpSalaryInfoController {
 	 * 2. Saves/updates PF/ESI/UAN details (EmpPfDetails)
 	 * 3. Updates checklist IDs in Employee table
 	 * 4. Updates org_id (Company/Organization) in Employee table (if provided)
-	 * 5. Updates employee status to "Forward to CO" (Forward to Central Office)
+	 * 5. Updates employee status to "Pending at CO" (when forwarding to Central Office)
 	 * 6. Clears any previous remarks
 	 * 
 	 * @param salaryInfoDTO Contains tempPayrollId, salary info, checklist IDs, etc.

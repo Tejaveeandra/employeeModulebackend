@@ -39,7 +39,7 @@ public class FamilyInfoDTO {
 		private String lastName;
 		private Boolean isLate; // Late checkbox
 		private String occupation;
-		private Integer genderId; // Required NOT NULL - foreign key to sce_gender (auto-set for Father/Mother)
+		private Integer genderId; // NOT USED for Father/Mother (auto-set by backend: Father=Male, Mother=Female). REQUIRED for other relations - foreign key to sce_gender
 		private Integer bloodGroupId; // Required NOT NULL
 		private String email;
 		private String nationality; // Required NOT NULL

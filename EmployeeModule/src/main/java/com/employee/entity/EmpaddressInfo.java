@@ -29,7 +29,9 @@ public class EmpaddressInfo {
 	private String house_no;
 	private String landmark;
 	private String postal_code;
-	private long emrg_contact_no;
+	// Note: emrg_contact_no column does NOT exist in sce_emp_addrs table
+	// Removed to prevent SQL errors
+	// private long emrg_contact_no;
 	private int is_active;
 	
 	// Note: district_id column does NOT exist in sce_emp_addrs table
