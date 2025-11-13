@@ -1,5 +1,9 @@
 package com.employee.service;
 
+import java.util.List;
+import java.util.Optional;
+import java.util.stream.Collectors;
+
 import org.modelmapper.ModelMapper;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -206,6 +210,12 @@ public class EmployeeService {
 
 	/**
 	 * Main onboarding method - handles all 8 tabs in one transaction
+	 * Supports both INSERT (new employee) and UPDATE (existing employee) operations
+	 * 
+	 * Flow:
+	 * 1. Check if employee exists by temp_payroll_id
+	 * 2. If exists: UPDATE existing employee and all child tables
+	 * 3. If not exists: INSERT new employee (creates new emp_id)
 	 * 
 	 * IMPORTANT: Sequence Number Skipping in PostgreSQL
 	 * ===================================================
@@ -236,8 +246,49 @@ public class EmployeeService {
 		}
 		
 		Employee employee = null;
+		boolean isUpdate = false;
+		
+		// Check if employee already exists by temp_payroll_id
+		if (onboardingDTO.getBasicInfo() != null && 
+				onboardingDTO.getBasicInfo().getTempPayrollId() != null && 
+				!onboardingDTO.getBasicInfo().getTempPayrollId().trim().isEmpty()) {
+			Optional<Employee> existingEmployee = employeeRepository.findByTemp_payroll_id(
+					onboardingDTO.getBasicInfo().getTempPayrollId().trim());
+			if (existingEmployee.isPresent()) {
+				employee = existingEmployee.get();
+				isUpdate = true;
+				logger.info("🔄 UPDATE MODE: Employee with temp_payroll_id '{}' already exists (emp_id: {}). Updating existing employee and child tables.", 
+						onboardingDTO.getBasicInfo().getTempPayrollId(), employee.getEmp_id());
+				
+				// Check if status is "Back to Campus" - update to "Pending at DO" and clear remarks
+				if (employee.getEmp_check_list_status_id() != null) {
+					String currentStatus = employee.getEmp_check_list_status_id().getCheck_app_status_name();
+					if ("Back to Campus".equals(currentStatus)) {
+						EmployeeCheckListStatus pendingAtDOStatus = employeeCheckListStatusRepository.findByCheck_app_status_name("Pending at DO")
+								.orElseThrow(() -> new ResourceNotFoundException("EmployeeCheckListStatus with name 'Pending at DO' not found"));
+						employee.setEmp_check_list_status_id(pendingAtDOStatus);
+						// Clear remarks when re-forwarding from "Back to Campus" to "Pending at DO"
+						employee.setRemarks(null);
+						logger.info("✅ Updated status from 'Back to Campus' to 'Pending at DO' and cleared remarks for employee (emp_id: {})", employee.getEmp_id());
+					}
+				}
+				
+				// Note: We will UPDATE existing child entities instead of deleting them
+				// This preserves data integrity and avoids deletion issues
+			}
+		}
+		
 		try {
+			if (!isUpdate) {
+				// INSERT MODE: Create new employee
 			employee = prepareEmployeeEntity(onboardingDTO.getBasicInfo());
+				logger.info("➕ INSERT MODE: Creating new employee with temp_payroll_id: {}", 
+						onboardingDTO.getBasicInfo() != null ? onboardingDTO.getBasicInfo().getTempPayrollId() : "N/A");
+			} else {
+				// UPDATE MODE: Update existing employee fields
+				updateEmployeeEntity(employee, onboardingDTO.getBasicInfo());
+				logger.info("🔄 UPDATE MODE: Updating existing employee (emp_id: {})", employee.getEmp_id());
+			}
 			// Only previous UAN and previous ESI numbers are stored at HR level (not current PF/ESI/UAN)
 			EmpPfDetails empPfDetails = prepareEmpPfDetailsEntity(onboardingDTO.getBasicInfo(), employee);
 			EmpDetails empDetails = prepareEmpDetailsEntity(onboardingDTO.getBasicInfo(), onboardingDTO.getAddressInfo(), employee);
@@ -250,31 +301,134 @@ public class EmployeeService {
 			prepareCategoryInfoUpdates(onboardingDTO.getCategoryInfo(), employee);
 			validatePreparedEntities(employee, empDetails, empPfDetails, addressEntities, familyEntities, 
 					experienceEntities, qualificationEntities, documentEntities, bankEntities);
+			
+			if (!isUpdate) {
+				// INSERT MODE: Save new employee (generates new emp_id)
 			employee = employeeRepository.save(employee);
 			logger.info("✅ Employee ID {} generated and consumed from sequence - proceeding with child entity saves", employee.getEmp_id());
+			} else {
+				// UPDATE MODE: Save existing employee (emp_id already exists)
+				employee = employeeRepository.save(employee);
+				logger.info("✅ Employee ID {} updated - proceeding with child entity saves", employee.getEmp_id());
+			}
 			
 			// Only previous UAN and previous ESI numbers are stored (not current PF/ESI/UAN)
 			if (empPfDetails != null) {
 				empPfDetails.setEmployee_id(employee);
+				// Update existing or create new
+				if (isUpdate) {
+					Optional<EmpPfDetails> existingPfDetails = empPfDetailsRepository.findByEmployeeId(employee.getEmp_id());
+					if (existingPfDetails.isPresent()) {
+						// Update existing record
+						EmpPfDetails existing = existingPfDetails.get();
+						existing.setPre_uan_no(empPfDetails.getPre_uan_no());
+						existing.setPre_esi_no(empPfDetails.getPre_esi_no());
+						existing.setIs_active(empPfDetails.getIs_active());
+						empPfDetailsRepository.save(existing);
+						logger.info("Updated existing EmpPfDetails for employee (emp_id: {})", employee.getEmp_id());
+					} else {
+						// Create new record
 				empPfDetailsRepository.save(empPfDetails);
+						logger.info("Created new EmpPfDetails for employee (emp_id: {})", employee.getEmp_id());
+					}
+				} else {
+					// INSERT MODE: Create new
+					empPfDetailsRepository.save(empPfDetails);
+				}
 			}
 			
+			// Update or create EmpDetails
 			empDetails.setEmployee_id(employee);
-			empDetailsRepository.save(empDetails);
+			if (isUpdate) {
+				// First, try to find by emp_id
+				Optional<EmpDetails> existingDetails = empDetailsRepository.findById(employee.getEmp_id());
+				
+				if (existingDetails.isPresent()) {
+					// Update existing record - copy all fields from new to existing
+					EmpDetails existing = existingDetails.get();
+					updateEmpDetailsFields(existing, empDetails);
+					empDetailsRepository.save(existing);
+					logger.info("Updated existing EmpDetails for employee (emp_id: {})", employee.getEmp_id());
+				} else {
+					// Not found by emp_id - check by email if email is provided
+					if (empDetails.getPersonal_email() != null && !empDetails.getPersonal_email().trim().isEmpty()) {
+						Optional<EmpDetails> existingByEmail = empDetailsRepository.findByPersonal_email(empDetails.getPersonal_email().trim());
+						
+						if (existingByEmail.isPresent()) {
+							// Email already exists - update that record (preserve email, update other fields)
+							EmpDetails existing = existingByEmail.get();
+							// Update all fields except email (preserve existing email to avoid unique constraint violation)
+							updateEmpDetailsFieldsExceptEmail(existing, empDetails);
+							// Update employee_id to point to current employee
+							existing.setEmployee_id(employee);
+							empDetailsRepository.save(existing);
+							logger.info("Updated existing EmpDetails found by email for employee (emp_id: {}), email: {}", 
+									employee.getEmp_id(), empDetails.getPersonal_email());
+						} else {
+							// Email doesn't exist - create new record
+							empDetailsRepository.save(empDetails);
+							logger.info("Created new EmpDetails for employee (emp_id: {})", employee.getEmp_id());
+						}
+					} else {
+						// No email provided - create new record
+						empDetailsRepository.save(empDetails);
+						logger.info("Created new EmpDetails for employee (emp_id: {})", employee.getEmp_id());
+					}
+				}
+			} else {
+				// INSERT MODE: Check if email already exists before creating
+				if (empDetails.getPersonal_email() != null && !empDetails.getPersonal_email().trim().isEmpty()) {
+					Optional<EmpDetails> existingByEmail = empDetailsRepository.findByPersonal_email(empDetails.getPersonal_email().trim());
+					
+					if (existingByEmail.isPresent()) {
+						// Email already exists - update that record (preserve email, update other fields)
+						EmpDetails existing = existingByEmail.get();
+						// Update all fields except email (preserve existing email to avoid unique constraint violation)
+						updateEmpDetailsFieldsExceptEmail(existing, empDetails);
+						// Update employee_id to point to current employee
+						existing.setEmployee_id(employee);
+						empDetailsRepository.save(existing);
+						logger.info("Updated existing EmpDetails found by email during INSERT for employee (emp_id: {}), email: {}", 
+								employee.getEmp_id(), empDetails.getPersonal_email());
+					} else {
+						// Email doesn't exist - create new record
+						empDetailsRepository.save(empDetails);
+						logger.info("Created new EmpDetails for employee (emp_id: {})", employee.getEmp_id());
+					}
+				} else {
+					// No email provided - create new record
+					empDetailsRepository.save(empDetails);
+					logger.info("Created new EmpDetails for employee (emp_id: {})", employee.getEmp_id());
+				}
+			}
 			
+			// Update or create list entities (UPDATE mode: overwrite existing, INSERT mode: create new)
+			if (isUpdate) {
+				// UPDATE MODE: Overwrite existing records
+				updateOrCreateAddressEntities(addressEntities, employee, onboardingDTO.getAddressInfo());
+				updateOrCreateFamilyEntities(familyEntities, employee);
+				updateOrCreateExperienceEntities(experienceEntities, employee);
+				updateOrCreateQualificationEntities(qualificationEntities, employee);
+				updateOrCreateDocumentEntities(documentEntities, employee);
+				updateOrCreateBankEntities(bankEntities, employee);
+			} else {
+				// INSERT MODE: Create new records
 			for (EmpaddressInfo addr : addressEntities) {
 				addr.setEmp_id(employee);
+					addr.setIs_active(1);
 				empaddressInfoRepository.save(addr);
 			}
 			
 			for (EmpFamilyDetails family : familyEntities) {
 				family.setEmp_id(employee);
+					family.setIs_active(1);
 				empFamilyDetailsRepository.save(family);
 			}
 			
 			for (EmpExperienceDetails exp : experienceEntities) {
 				try {
 					exp.setEmployee_id(employee);
+						exp.setIs_active(1);
 					empExperienceDetailsRepository.save(exp);
 				} catch (Exception e) {
 					logger.error("❌ CRITICAL: Failed to save EmpExperienceDetails. Employee ID {} was already consumed. Company: {}, Error: {}", 
@@ -287,12 +441,21 @@ public class EmployeeService {
 			
 			for (EmpQualification qual : qualificationEntities) {
 				qual.setEmp_id(employee);
+					qual.setIs_active(1);
 				empQualificationRepository.save(qual);
 			}
 			
 			for (EmpDocuments doc : documentEntities) {
 				doc.setEmp_id(employee);
+					doc.setIs_active(1);
 				empDocumentsRepository.save(doc);
+				}
+				
+				for (BankDetails bank : bankEntities) {
+					bank.setEmpId(employee);
+					bank.setIsActive(1);
+					bankDetailsRepository.save(bank);
+				}
 			}
 			
 			// Save Family Group Photo as a document if provided
@@ -320,9 +483,38 @@ public class EmployeeService {
 				}
 			}
 			
+			// Handle EmpSubject - update existing or create new
 			if (onboardingDTO.getCategoryInfo() != null && onboardingDTO.getCategoryInfo().getSubjectId() != null 
 					&& onboardingDTO.getCategoryInfo().getSubjectId() > 0
 					&& onboardingDTO.getCategoryInfo().getAgreedPeriodsPerWeek() != null) {
+				if (isUpdate) {
+					// Update existing or create new
+					int empId = employee.getEmp_id();
+					List<EmpSubject> existingEmpSubjects = empSubjectRepository.findAll().stream()
+							.filter(es -> es.getEmp_id() != null && es.getEmp_id().getEmp_id() == empId)
+							.collect(Collectors.toList());
+					
+					if (!existingEmpSubjects.isEmpty()) {
+						// Update first existing record
+						EmpSubject existing = existingEmpSubjects.get(0);
+						existing.setSubject_id(subjectRepository.findById(onboardingDTO.getCategoryInfo().getSubjectId())
+								.orElseThrow(() -> new ResourceNotFoundException("Subject not found with ID: " + onboardingDTO.getCategoryInfo().getSubjectId())));
+						existing.setAgree_no_period(onboardingDTO.getCategoryInfo().getAgreedPeriodsPerWeek());
+						existing.setIs_active(1);
+						empSubjectRepository.save(existing);
+						logger.info("Updated existing EmpSubject for employee (emp_id: {})", employee.getEmp_id());
+						
+						// Mark other existing records as inactive if there are multiple
+						if (existingEmpSubjects.size() > 1) {
+							for (int i = 1; i < existingEmpSubjects.size(); i++) {
+								existingEmpSubjects.get(i).setIs_active(0);
+								empSubjectRepository.save(existingEmpSubjects.get(i));
+							}
+							logger.info("Marked {} additional EmpSubject records as inactive for employee (emp_id: {})", 
+									existingEmpSubjects.size() - 1, employee.getEmp_id());
+						}
+					} else {
+						// Create new record
 				EmpSubject empSubject = new EmpSubject();
 				empSubject.setEmp_id(employee);
 				empSubject.setSubject_id(subjectRepository.findById(onboardingDTO.getCategoryInfo().getSubjectId())
@@ -331,12 +523,21 @@ public class EmployeeService {
 				empSubject.setClass_id(null);
 				empSubject.setIs_active(1);
 				empSubjectRepository.save(empSubject);
+						logger.info("Created new EmpSubject for employee (emp_id: {})", employee.getEmp_id());
+					}
+				} else {
+					// INSERT MODE: Create new
+					EmpSubject empSubject = new EmpSubject();
+					empSubject.setEmp_id(employee);
+					empSubject.setSubject_id(subjectRepository.findById(onboardingDTO.getCategoryInfo().getSubjectId())
+							.orElseThrow(() -> new ResourceNotFoundException("Subject not found with ID: " + onboardingDTO.getCategoryInfo().getSubjectId())));
+					empSubject.setAgree_no_period(onboardingDTO.getCategoryInfo().getAgreedPeriodsPerWeek());
+					empSubject.setClass_id(null);
+					empSubject.setIs_active(1);
+					empSubjectRepository.save(empSubject);
+				}
 			}
 			
-			for (BankDetails bank : bankEntities) {
-				bank.setEmpId(employee);
-				bankDetailsRepository.save(bank);
-			}
 			
 			employeeRepository.save(employee);
 			
@@ -433,54 +634,6 @@ public class EmployeeService {
 		}
 	}
 
-	private void validateAllEntitiesCanBeCreated(EmployeeOnboardingDTO onboardingDTO) {
-		BasicInfoDTO basicInfo = onboardingDTO.getBasicInfo();
-		if (basicInfo == null) return;
-		
-		if (basicInfo.getFirstName() == null || basicInfo.getFirstName().trim().isEmpty()) {
-			throw new ResourceNotFoundException("First Name is required");
-		}
-		if (basicInfo.getLastName() == null || basicInfo.getLastName().trim().isEmpty()) {
-			throw new ResourceNotFoundException("Last Name is required");
-		}
-		// Email is optional - goes to EmpDetails.personal_email only (not Employee entity)
-		// Email validation removed - personal_email is nullable in database
-		
-		String username = (basicInfo.getFirstName() + "." + basicInfo.getLastName()).toLowerCase();
-		if (username.length() > 50) {
-			username = username.substring(0, 50);
-		}
-		if (username.trim().isEmpty()) {
-			throw new ResourceNotFoundException("Cannot generate valid username from name");
-		}
-		
-		if (basicInfo.getGenderId() == null) {
-			throw new ResourceNotFoundException("Gender ID is required");
-		}
-		if (basicInfo.getDesignationId() == null) {
-			throw new ResourceNotFoundException("Designation ID is required");
-		}
-		if (basicInfo.getDepartmentId() == null) {
-			throw new ResourceNotFoundException("Department ID is required");
-		}
-		if (basicInfo.getCategoryId() == null) {
-			throw new ResourceNotFoundException("Category ID is required");
-		}
-		if (basicInfo.getBloodGroupId() == null) {
-			throw new ResourceNotFoundException("BloodGroup ID is required");
-		}
-		if (basicInfo.getCasteId() == null) {
-			throw new ResourceNotFoundException("Caste ID is required");
-		}
-		if (basicInfo.getReligionId() == null) {
-			throw new ResourceNotFoundException("Religion ID is required");
-		}
-		if (basicInfo.getMaritalStatusId() == null) {
-			throw new ResourceNotFoundException("MaritalStatus ID is required");
-		}
-		maritalStatusRepository.findByIdAndIsActive(basicInfo.getMaritalStatusId(), 1)
-			.orElseThrow(() -> new ResourceNotFoundException("Active MaritalStatus not found with ID: " + basicInfo.getMaritalStatusId()));
-	}
 
 	/**
 	 * Validate all onboarding data BEFORE any database operation
@@ -606,14 +759,8 @@ public class EmployeeService {
 			skillTestDetlRepository.findByTempPayrollId(basicInfo.getTempPayrollId())
 				.orElseThrow(() -> new ResourceNotFoundException("Temp Payroll ID not found in Skill Test Details: " + basicInfo.getTempPayrollId() + ". Please provide a valid temp payroll ID."));
 			
-			// Validate that temp_payroll_id does not already exist in Employee table (prevent duplicates)
-			employeeRepository.findByTemp_payroll_id(basicInfo.getTempPayrollId().trim())
-				.ifPresent(existingEmployee -> {
-					throw new ResourceNotFoundException(
-						"Employee with temp_payroll_id '" + basicInfo.getTempPayrollId() + 
-						"' already exists in the system (emp_id: " + existingEmployee.getEmp_id() + 
-						"). Each temp_payroll_id must be unique. Please use a different temp_payroll_id.");
-				});
+			// Note: We no longer throw error if temp_payroll_id already exists
+			// The onboardEmployee method will handle both INSERT (new employee) and UPDATE (existing employee) cases
 		}
 
 		if (onboardingDTO.getAddressInfo() != null) {
@@ -1648,33 +1795,6 @@ public class EmployeeService {
 		}
 		
 	}
-	/**
-	 * Saves address information for employee
-	 * 
-	 * Behavior:
-	 * - Always saves currentAddress (if provided) as "CURRENT" type
-	 * - If permanentAddressSameAsCurrent = true:
-	 *   → Saves ONLY currentAddress as one record (permanentAddress is same, so no need to save separately)
-	 *   → permanentAddress field is IGNORED
-	 * - If permanentAddressSameAsCurrent = false/null:
-	 *   → Saves permanentAddress data (if provided) as separate "PERMANENT" type record
-	 */
-	private void saveAddressInfo(AddressInfoDTO addressInfo, Employee employee) {
-		if (addressInfo == null) return;
-
-		if (addressInfo.getCurrentAddress() != null) {
-			EmpaddressInfo currentAddr = createAddressEntity(addressInfo.getCurrentAddress(), employee, "CURR");
-			empaddressInfoRepository.save(currentAddr);
-		}
-
-		if (Boolean.TRUE.equals(addressInfo.getPermanentAddressSameAsCurrent())) {
-		} else {
-			if (addressInfo.getPermanentAddress() != null) {
-				EmpaddressInfo permanentAddr = createAddressEntity(addressInfo.getPermanentAddress(), employee, "PERM");
-				empaddressInfoRepository.save(permanentAddr);
-			}
-		}
-	}
 
 	private EmpaddressInfo createAddressEntity(AddressInfoDTO.AddressDTO addressDTO, Employee employee, String addressType) {
 		EmpaddressInfo address = new EmpaddressInfo();
@@ -1711,18 +1831,6 @@ public class EmployeeService {
 		return address;
 	}
 
-	private void saveFamilyInfo(FamilyInfoDTO familyInfo, Employee employee) {
-		if (familyInfo == null || familyInfo.getFamilyMembers() == null || familyInfo.getFamilyMembers().isEmpty()) {
-			return;
-		}
-
-		for (FamilyInfoDTO.FamilyMemberDTO memberDTO : familyInfo.getFamilyMembers()) {
-			if (memberDTO != null) {
-				EmpFamilyDetails familyMember = createFamilyMemberEntity(memberDTO, employee);
-				empFamilyDetailsRepository.save(familyMember);
-			}
-		}
-	}
 
 	private EmpFamilyDetails createFamilyMemberEntity(FamilyInfoDTO.FamilyMemberDTO memberDTO, Employee employee) {
 		EmpFamilyDetails familyMember = new EmpFamilyDetails();
@@ -1831,296 +1939,10 @@ public class EmployeeService {
 		return familyMember;
 	}
 
-	private void savePreviousEmployerInfo(PreviousEmployerInfoDTO previousEmployerInfo, Employee employee) {
-		if (previousEmployerInfo == null || previousEmployerInfo.getPreviousEmployers() == null) return;
 
-		for (PreviousEmployerInfoDTO.EmployerDetailsDTO employerDTO : previousEmployerInfo.getPreviousEmployers()) {
-			EmpExperienceDetails experience = new EmpExperienceDetails();
-			
-			experience.setEmployee_id(employee);
-			
-			if (employerDTO.getCompanyName() != null) {
-				experience.setPre_organigation_name(employerDTO.getCompanyName());
-			} else {
-				throw new ResourceNotFoundException("Company Name is required (NOT NULL column)");
-			}
-			
-			if (employerDTO.getFromDate() != null) {
-				experience.setDate_of_join(employerDTO.getFromDate());
-			} else {
-				throw new ResourceNotFoundException("From Date is required (NOT NULL column)");
-			}
-			
-			if (employerDTO.getToDate() != null) {
-				experience.setDate_of_leave(employerDTO.getToDate());
-			} else {
-				throw new ResourceNotFoundException("To Date is required (NOT NULL column)");
-			}
-			
-			if (employerDTO.getDesignation() != null) {
-				experience.setDesignation(employerDTO.getDesignation());
-			} else {
-				throw new ResourceNotFoundException("Designation is required (NOT NULL column)");
-			}
-			
-			if (employerDTO.getLeavingReason() != null) {
-				experience.setLeaving_reason(employerDTO.getLeavingReason());
-			} else {
-				throw new ResourceNotFoundException("Leaving Reason is required (NOT NULL column)");
-			}
-			
-			if (employerDTO.getNatureOfDuties() != null) {
-				experience.setNature_of_duties(employerDTO.getNatureOfDuties());
-			} else {
-				throw new ResourceNotFoundException("Nature of Duties is required (NOT NULL column)");
-			}
-			
-			String companyAddress = employerDTO.getCompanyAddressLine1() != null ? employerDTO.getCompanyAddressLine1() : "";
-			if (employerDTO.getCompanyAddressLine2() != null) {
-				companyAddress += " " + employerDTO.getCompanyAddressLine2();
-			}
-			if (companyAddress.trim().isEmpty()) {
-				throw new ResourceNotFoundException("Company Address is required (NOT NULL column)");
-			}
-			experience.setCompany_addr(companyAddress.trim());
-			
-			// Required NOT NULL
-			experience.setGross_salary(employerDTO.getGrossSalaryPerMonth() != null ? employerDTO.getGrossSalaryPerMonth() : 0);
-			
-			experience.setIs_active(1);
-			// If preChaitanyaId is null or 0, set it to null (not 0)
-			Integer preChaitanyaId = employerDTO.getPreChaitanyaId();
-			experience.setPre_chaitanya_id((preChaitanyaId != null && preChaitanyaId > 0) ? preChaitanyaId : null);
 
-			empExperienceDetailsRepository.save(experience);
-		}
-	}
 
-	// Tab 5: Qualification
-	private void saveQualifications(QualificationDTO qualification, Employee employee) {
-		if (qualification == null || qualification.getQualifications() == null) return;
 
-		// Validate: Only ONE qualification should have isHighest = true
-		long highestCount = qualification.getQualifications().stream()
-				.filter(qual -> Boolean.TRUE.equals(qual.getIsHighest()))
-				.count();
-		
-		if (highestCount > 1) {
-			throw new IllegalArgumentException(
-					"Only one qualification can be marked as highest. Found " + highestCount + " qualifications with isHighest = true.");
-		}
-
-		Integer highestQualificationId = null;
-
-		for (QualificationDTO.QualificationDetailsDTO qualDTO : qualification.getQualifications()) {
-			EmpQualification empQual = new EmpQualification();
-			empQual.setEmp_id(employee);
-			empQual.setPassedout_year(qualDTO.getPassedOutYear());
-			empQual.setSpecialization(qualDTO.getSpecialization());
-			empQual.setUniversity(qualDTO.getUniversity());
-			empQual.setInstitute(qualDTO.getInstitute());
-
-			if (qualDTO.getQualificationId() != null) {
-				empQual.setQualification_id(qualificationRepository.findById(qualDTO.getQualificationId())
-						.orElseThrow(() -> new ResourceNotFoundException("Qualification not found")));
-			}
-
-			if (qualDTO.getQualificationDegreeId() != null) {
-				empQual.setQualification_degree_id(qualificationDegreeRepository.findById(qualDTO.getQualificationDegreeId())
-						.orElseThrow(() -> new ResourceNotFoundException("QualificationDegree not found")));
-			}
-
-			empQual.setIs_active(1);
-
-		empQualificationRepository.save(empQual);
-
-			if (Boolean.TRUE.equals(qualDTO.getIsHighest())) {
-				highestQualificationId = qualDTO.getQualificationId();
-			}
-		}
-
-		// Update Employee with highest qualification
-		if (highestQualificationId != null) {
-			employee.setQualification_id(qualificationRepository.findById(highestQualificationId)
-					.orElseThrow(() -> new ResourceNotFoundException("Qualification not found")));
-			employeeRepository.save(employee);
-		}
-	}
-
-	// Tab 6: Documents
-	private void saveDocuments(DocumentDTO documents, Employee employee) {
-		if (documents == null || documents.getDocuments() == null) return;
-
-		for (DocumentDTO.DocumentDetailsDTO docDTO : documents.getDocuments()) {
-			EmpDocuments doc = new EmpDocuments();
-			
-			// Required NOT NULL - foreign key to sce_emp
-			doc.setEmp_id(employee);
-			
-			doc.setDoc_path(docDTO.getDocPath());
-			
-			// Set ssc_no ONLY if doc_type_id = 1 (SSC document type)
-			if (docDTO.getDocTypeId() != null && docDTO.getDocTypeId() == 1) {
-				doc.setSsc_no(docDTO.getSscNo());
-			} else {
-				doc.setSsc_no(null); // Don't save ssc_no for other document types
-			}
-			
-			doc.setIs_verified(docDTO.getIsVerified() != null && docDTO.getIsVerified() ? 1 : 0);
-			doc.setIs_active(1);
-
-			// Required NOT NULL - foreign key to sce_doc_type
-			if (docDTO.getDocTypeId() != null) {
-				doc.setEmp_doc_type_id(empDocTypeRepository.findById(docDTO.getDocTypeId())
-						.orElseThrow(() -> new ResourceNotFoundException("DocumentType not found")));
-			} else {
-				throw new ResourceNotFoundException("Document Type ID is required (NOT NULL column)");
-			}
-
-			empDocumentsRepository.save(doc);
-		}
-	}
-
-	private void updateCategoryInfo(CategoryInfoDTO categoryInfo, Employee employee) {
-		if (categoryInfo == null) return;
-
-		if (categoryInfo.getEmployeeTypeId() != null) {
-			employee.setEmployee_type_id(employeeTypeRepository.findById(categoryInfo.getEmployeeTypeId())
-					.orElseThrow(() -> new ResourceNotFoundException("EmployeeType not found")));
-		}
-		if (categoryInfo.getDepartmentId() != null) {
-			employee.setDepartment(departmentRepository.findById(categoryInfo.getDepartmentId())
-					.orElseThrow(() -> new ResourceNotFoundException("Department not found")));
-		}
-		if (categoryInfo.getDesignationId() != null) {
-			employee.setDesignation(designationRepository.findById(categoryInfo.getDesignationId())
-					.orElseThrow(() -> new ResourceNotFoundException("Designation not found")));
-		}
-
-		employeeRepository.save(employee);
-		
-		if (categoryInfo.getSubjectId() != null && categoryInfo.getSubjectId() > 0 
-				&& categoryInfo.getAgreedPeriodsPerWeek() != null) {
-			EmpSubject empSubject = new EmpSubject();
-			empSubject.setEmp_id(employee);
-			empSubject.setSubject_id(subjectRepository.findById(categoryInfo.getSubjectId())
-					.orElseThrow(() -> new ResourceNotFoundException("Subject not found with ID: " + categoryInfo.getSubjectId())));
-			empSubject.setAgree_no_period(categoryInfo.getAgreedPeriodsPerWeek());
-			empSubject.setClass_id(null);
-			empSubject.setIs_active(1);
-			
-			empSubjectRepository.save(empSubject);
-		}
-	}
-
-	private void saveBankInfo(BankInfoDTO bankInfo, Employee employee) {
-		if (bankInfo == null) return;
-
-		EmpPaymentType paymentType = null;
-		if (bankInfo.getPaymentTypeId() != null && bankInfo.getPaymentTypeId() > 0) {
-			paymentType = empPaymentTypeRepository.findByIdAndIsActive(bankInfo.getPaymentTypeId(), 1)
-					.orElseThrow(() -> new ResourceNotFoundException("Active Payment Type not found with ID: " + bankInfo.getPaymentTypeId() + ". Please ensure payment type exists and is active."));
-		}
-
-		if (bankInfo.getPersonalAccount() != null) {
-			BankDetails personalAccount = new BankDetails();
-			personalAccount.setEmpId(employee);
-			personalAccount.setAccType("PERSONAL");
-			
-			if (bankInfo.getPersonalAccount().getBankName() != null && !bankInfo.getPersonalAccount().getBankName().trim().isEmpty()) {
-			personalAccount.setBankName(bankInfo.getPersonalAccount().getBankName());
-			}
-			
-			// Bank branch is not required for personal accounts - leaving it null
-			personalAccount.setBankBranch(null);
-			
-			personalAccount.setBankHolderName(bankInfo.getPersonalAccount().getAccountHolderName());
-			personalAccount.setEmpPaymentType(paymentType);
-			
-			if (bankInfo.getPersonalAccount().getAccountNo() != null) {
-				try {
-					Long accNoLong = Long.parseLong(bankInfo.getPersonalAccount().getAccountNo());
-					personalAccount.setAccNo(accNoLong);
-				} catch (NumberFormatException e) {
-					throw new ResourceNotFoundException("Invalid account number format. Account number must be numeric.");
-				}
-			} else {
-				throw new ResourceNotFoundException("Account number is required (NOT NULL column)");
-			}
-			
-			if (bankInfo.getPersonalAccount().getIfscCode() != null) {
-				personalAccount.setIfscCode(bankInfo.getPersonalAccount().getIfscCode());
-			} else {
-				throw new ResourceNotFoundException("IFSC Code is required (NOT NULL column)");
-			}
-			
-			personalAccount.setNetPayable(null);
-			personalAccount.setIsActive(1);
-			bankDetailsRepository.save(personalAccount);
-		}
-
-		if (bankInfo.getSalaryAccount() != null) {
-			BankDetails salaryAccount = new BankDetails();
-			salaryAccount.setEmpId(employee);
-			salaryAccount.setAccType("SALARY");
-			
-			if (bankInfo.getBankBranchId() != null && bankInfo.getBankBranchId() > 0) {
-				OrgBankBranch orgBankBranch = orgBankBranchRepository.findById(bankInfo.getBankBranchId())
-						.orElseThrow(() -> new ResourceNotFoundException("Organization Bank Branch not found with ID: " + bankInfo.getBankBranchId()));
-				
-				if (orgBankBranch.getBranch_name() != null && !orgBankBranch.getBranch_name().trim().isEmpty()) {
-					salaryAccount.setBankBranch(orgBankBranch.getBranch_name());
-				}
-			}
-			
-			salaryAccount.setEmpPaymentType(paymentType);
-			
-			if (bankInfo.getBankId() != null && bankInfo.getBankId() > 0) {
-				OrgBank orgBank = orgBankRepository.findById(bankInfo.getBankId())
-						.orElseThrow(() -> new ResourceNotFoundException("Organization Bank not found with ID: " + bankInfo.getBankId()));
-				
-				if (orgBank.getBank_name() != null && !orgBank.getBank_name().trim().isEmpty()) {
-					salaryAccount.setBankName(orgBank.getBank_name());
-				}
-				
-				if (bankInfo.getSalaryAccount().getIfscCode() != null && !bankInfo.getSalaryAccount().getIfscCode().trim().isEmpty()) {
-					salaryAccount.setIfscCode(bankInfo.getSalaryAccount().getIfscCode());
-				} else if (orgBank.getIfsc_code() != null && !orgBank.getIfsc_code().trim().isEmpty()) {
-					salaryAccount.setIfscCode(orgBank.getIfsc_code());
-				} else {
-					throw new ResourceNotFoundException("IFSC Code is required (NOT NULL column). Please provide IFSC code either in salary account or ensure it exists in Organization Bank.");
-				}
-			} else {
-				if (bankInfo.getSalaryAccount().getIfscCode() != null && !bankInfo.getSalaryAccount().getIfscCode().trim().isEmpty()) {
-					salaryAccount.setIfscCode(bankInfo.getSalaryAccount().getIfscCode());
-				} else {
-					throw new ResourceNotFoundException("IFSC Code is required (NOT NULL column)");
-				}
-			}
-			
-			if (bankInfo.getSalaryAccount().getAccountHolderName() != null && !bankInfo.getSalaryAccount().getAccountHolderName().trim().isEmpty()) {
-				salaryAccount.setBankHolderName(bankInfo.getSalaryAccount().getAccountHolderName());
-			} else {
-				String employeeName = employee.getFirst_name() + " " + employee.getLast_name();
-				salaryAccount.setBankHolderName(employeeName.trim());
-			}
-			
-			if (bankInfo.getSalaryAccount().getAccountNo() != null) {
-				try {
-					Long accNoLong = Long.parseLong(bankInfo.getSalaryAccount().getAccountNo());
-					salaryAccount.setAccNo(accNoLong);
-				} catch (NumberFormatException e) {
-					throw new ResourceNotFoundException("Invalid account number format. Account number must be numeric.");
-				}
-			} else {
-				throw new ResourceNotFoundException("Account number is required (NOT NULL column)");
-			}
-			
-			salaryAccount.setNetPayable(null);
-			salaryAccount.setIsActive(1);
-			bankDetailsRepository.save(salaryAccount);
-		}
-	}
 
 	/**
 	 * Save Agreement Information and Cheque Details
@@ -2146,55 +1968,630 @@ public class EmployeeService {
 			employee.setIs_check_submit(agreementInfo.getIsCheckSubmit());
 			logger.info("Updated is_check_submit (OIS Check Submit) for employee (emp_id: {}): {}", 
 					employee.getEmp_id(), agreementInfo.getIsCheckSubmit());
-		} else {
+			} else {
 			logger.debug("is_check_submit not provided in AgreementInfoDTO, keeping existing value for employee (emp_id: {})", 
 					employee.getEmp_id());
 		}
 		
 		// Save cheque details only if provided_cheque is true
-		// Supports multiple cheques - each cheque in the list creates a separate EmpChequeDetails record
+		// Supports multiple cheques - each cheque in the list creates or updates a separate EmpChequeDetails record
 		if (Boolean.TRUE.equals(agreementInfo.getProvidedCheque()) 
 				&& agreementInfo.getChequeDetails() != null 
 				&& !agreementInfo.getChequeDetails().isEmpty()) {
 			
-			// Loop through all cheques and save each one as a separate record
-			for (AgreementInfoDTO.ChequeDetailDTO chequeDTO : agreementInfo.getChequeDetails()) {
+			int empId = employee.getEmp_id();
+			// Get existing active cheque details for this employee
+			List<EmpChequeDetails> existingCheques = empChequeDetailsRepository.findAll().stream()
+					.filter(c -> c.getEmpId() != null && c.getEmpId().getEmp_id() == empId && c.getIsActive() == 1)
+					.collect(Collectors.toList());
+			
+			// Process new cheques - update existing or create new
+			for (int i = 0; i < agreementInfo.getChequeDetails().size(); i++) {
+				AgreementInfoDTO.ChequeDetailDTO chequeDTO = agreementInfo.getChequeDetails().get(i);
 				if (chequeDTO == null) continue;
-				
-				EmpChequeDetails cheque = new EmpChequeDetails();
-				cheque.setEmpId(employee);
 				
 				if (chequeDTO.getChequeNo() == null) {
 					throw new ResourceNotFoundException("Cheque Number is required (NOT NULL column)");
 				}
-				cheque.setChequeNo(chequeDTO.getChequeNo());
 				
 				if (chequeDTO.getChequeBankName() == null || chequeDTO.getChequeBankName().trim().isEmpty()) {
 					throw new ResourceNotFoundException("Cheque Bank Name is required (NOT NULL column)");
 				}
-				cheque.setChequeBankName(chequeDTO.getChequeBankName().trim());
 				
 				if (chequeDTO.getChequeBankIfscCode() == null || chequeDTO.getChequeBankIfscCode().trim().isEmpty()) {
 					throw new ResourceNotFoundException("Cheque Bank IFSC Code is required (NOT NULL column)");
 				}
-				cheque.setChequeBankIfscCode(chequeDTO.getChequeBankIfscCode().trim());
 				
-				cheque.setIsActive(1);
-				
-				// Set audit fields
-				if (employee.getCreated_by() != null) {
-					cheque.setCreatedBy(employee.getCreated_by());
+				if (i < existingCheques.size()) {
+					// Update existing record
+					EmpChequeDetails existing = existingCheques.get(i);
+					existing.setChequeNo(chequeDTO.getChequeNo());
+					existing.setChequeBankName(chequeDTO.getChequeBankName().trim());
+					existing.setChequeBankIfscCode(chequeDTO.getChequeBankIfscCode().trim());
+					existing.setIsActive(1);
+					existing.setUpdatedDate(new java.sql.Timestamp(System.currentTimeMillis()));
+					empChequeDetailsRepository.save(existing);
+					logger.debug("Updated existing EmpChequeDetails[{}] for employee (emp_id: {})", i, empId);
 				} else {
-					cheque.setCreatedBy(1);
+					// Create new record
+					EmpChequeDetails cheque = new EmpChequeDetails();
+					cheque.setEmpId(employee);
+					cheque.setChequeNo(chequeDTO.getChequeNo());
+					cheque.setChequeBankName(chequeDTO.getChequeBankName().trim());
+					cheque.setChequeBankIfscCode(chequeDTO.getChequeBankIfscCode().trim());
+					cheque.setIsActive(1);
+					
+					// Set audit fields
+					if (employee.getCreated_by() != null) {
+						cheque.setCreatedBy(employee.getCreated_by());
+					} else {
+						cheque.setCreatedBy(1);
+					}
+					cheque.setCreatedDate(new java.sql.Timestamp(System.currentTimeMillis()));
+					
+					empChequeDetailsRepository.save(cheque);
+					logger.debug("Created new EmpChequeDetails[{}] for employee (emp_id: {})", i, empId);
 				}
-				cheque.setCreatedDate(new java.sql.Timestamp(System.currentTimeMillis()));
-				
-				empChequeDetailsRepository.save(cheque);
 			}
 			
-			logger.info("✅ Saved {} cheque details for Employee ID: {}", 
+			// Mark any extra existing cheques as inactive
+			if (existingCheques.size() > agreementInfo.getChequeDetails().size()) {
+				for (int i = agreementInfo.getChequeDetails().size(); i < existingCheques.size(); i++) {
+					existingCheques.get(i).setIsActive(0);
+					existingCheques.get(i).setUpdatedDate(new java.sql.Timestamp(System.currentTimeMillis()));
+					empChequeDetailsRepository.save(existingCheques.get(i));
+					logger.debug("Marked EmpChequeDetails[{}] as inactive for employee (emp_id: {})", i, empId);
+				}
+			}
+			
+			logger.info("✅ Updated/Created {} cheque details for Employee ID: {}", 
 					agreementInfo.getChequeDetails().size(), employee.getEmp_id());
+		} else {
+			// If provided_cheque is false or null, mark all existing cheques as inactive
+			int empId = employee.getEmp_id();
+			List<EmpChequeDetails> existingCheques = empChequeDetailsRepository.findAll().stream()
+					.filter(c -> c.getEmpId() != null && c.getEmpId().getEmp_id() == empId && c.getIsActive() == 1)
+					.collect(Collectors.toList());
+			
+			for (EmpChequeDetails existing : existingCheques) {
+				existing.setIsActive(0);
+				existing.setUpdatedDate(new java.sql.Timestamp(System.currentTimeMillis()));
+				empChequeDetailsRepository.save(existing);
+			}
+			
+			if (!existingCheques.isEmpty()) {
+				logger.info("Marked {} existing cheque details as inactive (providedCheque=false) for Employee ID: {}", 
+						existingCheques.size(), empId);
+			}
 		}
 	}
+	
+	/**
+	 * Update EmpDetails fields from source to target
+	 * Helper method to copy all fields when updating existing record
+	 */
+	private void updateEmpDetailsFields(EmpDetails target, EmpDetails source) {
+		target.setAdhaar_name(source.getAdhaar_name());
+		target.setDate_of_birth(source.getDate_of_birth());
+		target.setPersonal_email(source.getPersonal_email());
+		target.setEmergency_ph_no(source.getEmergency_ph_no());
+		target.setRelation_id(source.getRelation_id());
+		target.setAdhaar_no(source.getAdhaar_no());
+		target.setPancard_no(source.getPancard_no());
+		target.setAdhaar_enrolment_no(source.getAdhaar_enrolment_no());
+		target.setBloodGroup_id(source.getBloodGroup_id());
+		target.setCaste_id(source.getCaste_id());
+		target.setReligion_id(source.getReligion_id());
+		target.setMarital_status_id(source.getMarital_status_id());
+		target.setIs_active(source.getIs_active());
+		target.setStatus(source.getStatus());
+	}
+	
+	/**
+	 * Update EmpDetails fields except personal_email (preserve existing email)
+	 * Used when email already exists in database to avoid unique constraint violation
+	 */
+	private void updateEmpDetailsFieldsExceptEmail(EmpDetails target, EmpDetails source) {
+		target.setAdhaar_name(source.getAdhaar_name());
+		target.setDate_of_birth(source.getDate_of_birth());
+		// DO NOT update personal_email - preserve existing email to avoid unique constraint violation
+		// target.setPersonal_email(source.getPersonal_email()); // SKIPPED
+		target.setEmergency_ph_no(source.getEmergency_ph_no());
+		target.setRelation_id(source.getRelation_id());
+		target.setAdhaar_no(source.getAdhaar_no());
+		target.setPancard_no(source.getPancard_no());
+		target.setAdhaar_enrolment_no(source.getAdhaar_enrolment_no());
+		target.setBloodGroup_id(source.getBloodGroup_id());
+		target.setCaste_id(source.getCaste_id());
+		target.setReligion_id(source.getReligion_id());
+		target.setMarital_status_id(source.getMarital_status_id());
+		target.setIs_active(source.getIs_active());
+		target.setStatus(source.getStatus());
+	}
+	
+	/**
+	 * Update or create Address entities - overwrites existing records
+	 * When permanentAddressSameAsCurrent = true, only CURR address is saved and PERM is marked inactive
+	 */
+	private void updateOrCreateAddressEntities(List<EmpaddressInfo> newAddresses, Employee employee, AddressInfoDTO addressInfo) {
+		int empId = employee.getEmp_id();
+		List<EmpaddressInfo> existingAddresses = empaddressInfoRepository.findAll().stream()
+				.filter(addr -> addr.getEmp_id() != null && addr.getEmp_id().getEmp_id() == empId && addr.getIs_active() == 1)
+				.collect(Collectors.toList());
+		
+		// Process new addresses - match by address type (CURR/PERM) instead of index
+		for (EmpaddressInfo newAddr : newAddresses) {
+			newAddr.setEmp_id(employee);
+			newAddr.setIs_active(1);
+			
+			// Find existing address with same type (CURR or PERM)
+			Optional<EmpaddressInfo> existingByType = existingAddresses.stream()
+					.filter(addr -> addr.getAddrs_type() != null && 
+							addr.getAddrs_type().equals(newAddr.getAddrs_type()))
+					.findFirst();
+			
+			if (existingByType.isPresent()) {
+				// Update existing record with same type
+				EmpaddressInfo existing = existingByType.get();
+				updateAddressFields(existing, newAddr);
+				empaddressInfoRepository.save(existing);
+				existingAddresses.remove(existing); // Remove from list so it won't be marked inactive
+				logger.debug("Updated existing EmpaddressInfo (type: {}) for employee (emp_id: {})", 
+						newAddr.getAddrs_type(), empId);
+			} else {
+				// Create new record
+				empaddressInfoRepository.save(newAddr);
+				logger.debug("Created new EmpaddressInfo (type: {}) for employee (emp_id: {})", 
+						newAddr.getAddrs_type(), empId);
+			}
+		}
+		
+		// CRITICAL: If permanentAddressSameAsCurrent = true, explicitly mark any PERM addresses as inactive
+		// This ensures only CURR address is active when permanent address is same as current
+		int permInactiveCount = 0;
+		if (addressInfo != null && Boolean.TRUE.equals(addressInfo.getPermanentAddressSameAsCurrent())) {
+			for (EmpaddressInfo existingAddr : existingAddresses) {
+				if ("PERM".equals(existingAddr.getAddrs_type())) {
+					existingAddr.setIs_active(0);
+					empaddressInfoRepository.save(existingAddr);
+					permInactiveCount++;
+					logger.debug("Marked PERM EmpaddressInfo as inactive (permanentAddressSameAsCurrent=true) for employee (emp_id: {})", empId);
+				}
+			}
+			// Remove PERM addresses from the list so they won't be processed again
+			existingAddresses.removeIf(addr -> "PERM".equals(addr.getAddrs_type()));
+		}
+		
+		// Mark any remaining existing addresses as inactive (these are addresses that weren't in new list)
+		for (EmpaddressInfo remainingAddr : existingAddresses) {
+			remainingAddr.setIs_active(0);
+			empaddressInfoRepository.save(remainingAddr);
+			logger.debug("Marked EmpaddressInfo (type: {}) as inactive for employee (emp_id: {})", 
+					remainingAddr.getAddrs_type(), empId);
+		}
+		
+		int totalInactiveCount = existingAddresses.size() + permInactiveCount;
+		logger.info("Updated/Created {} address records for employee (emp_id: {}). permanentAddressSameAsCurrent={}, Marked {} as inactive ({} PERM + {} others).", 
+				newAddresses.size(), empId, 
+				addressInfo != null ? addressInfo.getPermanentAddressSameAsCurrent() : false, 
+				totalInactiveCount, permInactiveCount, existingAddresses.size());
+	}
+	
+	/**
+	 * Update or create Family entities - overwrites existing records
+	 */
+	private void updateOrCreateFamilyEntities(List<EmpFamilyDetails> newFamily, Employee employee) {
+		int empId = employee.getEmp_id();
+		List<EmpFamilyDetails> existingFamily = empFamilyDetailsRepository.findAll().stream()
+				.filter(fam -> fam.getEmp_id() != null && fam.getEmp_id().getEmp_id() == empId && fam.getIs_active() == 1)
+				.collect(Collectors.toList());
+		
+		int maxSize = Math.max(newFamily.size(), existingFamily.size());
+		for (int i = 0; i < maxSize; i++) {
+			if (i < newFamily.size()) {
+				EmpFamilyDetails newFam = newFamily.get(i);
+				newFam.setEmp_id(employee);
+				newFam.setIs_active(1);
+				
+				if (i < existingFamily.size()) {
+					// Update existing record
+					EmpFamilyDetails existing = existingFamily.get(i);
+					updateFamilyFields(existing, newFam);
+					empFamilyDetailsRepository.save(existing);
+					logger.debug("Updated existing EmpFamilyDetails[{}] for employee (emp_id: {})", i, empId);
+				} else {
+					// Create new record
+					empFamilyDetailsRepository.save(newFam);
+					logger.debug("Created new EmpFamilyDetails[{}] for employee (emp_id: {})", i, empId);
+				}
+			} else if (i < existingFamily.size()) {
+				// Mark extra existing records as inactive
+				existingFamily.get(i).setIs_active(0);
+				empFamilyDetailsRepository.save(existingFamily.get(i));
+				logger.debug("Marked EmpFamilyDetails[{}] as inactive for employee (emp_id: {})", i, empId);
+			}
+		}
+		logger.info("Updated/Created {} family records for employee (emp_id: {})", newFamily.size(), empId);
+	}
+	
+	/**
+	 * Update or create Experience entities - overwrites existing records
+	 */
+	private void updateOrCreateExperienceEntities(List<EmpExperienceDetails> newExperience, Employee employee) {
+		int empId = employee.getEmp_id();
+		List<EmpExperienceDetails> existingExperience = empExperienceDetailsRepository.findAll().stream()
+				.filter(exp -> exp.getEmployee_id() != null && exp.getEmployee_id().getEmp_id() == empId && exp.getIs_active() == 1)
+				.collect(Collectors.toList());
+		
+		int maxSize = Math.max(newExperience.size(), existingExperience.size());
+		for (int i = 0; i < maxSize; i++) {
+			if (i < newExperience.size()) {
+				EmpExperienceDetails newExp = newExperience.get(i);
+				newExp.setEmployee_id(employee);
+				newExp.setIs_active(1);
+				
+				if (i < existingExperience.size()) {
+					// Update existing record
+					EmpExperienceDetails existing = existingExperience.get(i);
+					updateExperienceFields(existing, newExp);
+					empExperienceDetailsRepository.save(existing);
+					logger.debug("Updated existing EmpExperienceDetails[{}] for employee (emp_id: {})", i, empId);
+			} else {
+					// Create new record
+					empExperienceDetailsRepository.save(newExp);
+					logger.debug("Created new EmpExperienceDetails[{}] for employee (emp_id: {})", i, empId);
+				}
+			} else if (i < existingExperience.size()) {
+				// Mark extra existing records as inactive
+				existingExperience.get(i).setIs_active(0);
+				empExperienceDetailsRepository.save(existingExperience.get(i));
+				logger.debug("Marked EmpExperienceDetails[{}] as inactive for employee (emp_id: {})", i, empId);
+			}
+		}
+		logger.info("Updated/Created {} experience records for employee (emp_id: {})", newExperience.size(), empId);
+	}
+	
+	/**
+	 * Update or create Qualification entities - overwrites existing records
+	 */
+	private void updateOrCreateQualificationEntities(List<EmpQualification> newQualification, Employee employee) {
+		int empId = employee.getEmp_id();
+		List<EmpQualification> existingQualification = empQualificationRepository.findAll().stream()
+				.filter(qual -> qual.getEmp_id() != null && qual.getEmp_id().getEmp_id() == empId && qual.getIs_active() == 1)
+				.collect(Collectors.toList());
+		
+		int maxSize = Math.max(newQualification.size(), existingQualification.size());
+		for (int i = 0; i < maxSize; i++) {
+			if (i < newQualification.size()) {
+				EmpQualification newQual = newQualification.get(i);
+				newQual.setEmp_id(employee);
+				newQual.setIs_active(1);
+				
+				if (i < existingQualification.size()) {
+					// Update existing record
+					EmpQualification existing = existingQualification.get(i);
+					updateQualificationFields(existing, newQual);
+					empQualificationRepository.save(existing);
+					logger.debug("Updated existing EmpQualification[{}] for employee (emp_id: {})", i, empId);
+			} else {
+					// Create new record
+					empQualificationRepository.save(newQual);
+					logger.debug("Created new EmpQualification[{}] for employee (emp_id: {})", i, empId);
+				}
+			} else if (i < existingQualification.size()) {
+				// Mark extra existing records as inactive
+				existingQualification.get(i).setIs_active(0);
+				empQualificationRepository.save(existingQualification.get(i));
+				logger.debug("Marked EmpQualification[{}] as inactive for employee (emp_id: {})", i, empId);
+			}
+		}
+		logger.info("Updated/Created {} qualification records for employee (emp_id: {})", newQualification.size(), empId);
+	}
+	
+	/**
+	 * Update or create Document entities - overwrites existing records
+	 */
+	private void updateOrCreateDocumentEntities(List<EmpDocuments> newDocuments, Employee employee) {
+		int empId = employee.getEmp_id();
+		List<EmpDocuments> existingDocuments = empDocumentsRepository.findAll().stream()
+				.filter(doc -> doc.getEmp_id() != null && doc.getEmp_id().getEmp_id() == empId && doc.getIs_active() == 1)
+				.collect(Collectors.toList());
+		
+		int maxSize = Math.max(newDocuments.size(), existingDocuments.size());
+		for (int i = 0; i < maxSize; i++) {
+			if (i < newDocuments.size()) {
+				EmpDocuments newDoc = newDocuments.get(i);
+				newDoc.setEmp_id(employee);
+				newDoc.setIs_active(1);
+				
+				if (i < existingDocuments.size()) {
+					// Update existing record
+					EmpDocuments existing = existingDocuments.get(i);
+					updateDocumentFields(existing, newDoc);
+					empDocumentsRepository.save(existing);
+					logger.debug("Updated existing EmpDocuments[{}] for employee (emp_id: {})", i, empId);
+				} else {
+					// Create new record
+					empDocumentsRepository.save(newDoc);
+					logger.debug("Created new EmpDocuments[{}] for employee (emp_id: {})", i, empId);
+				}
+			} else if (i < existingDocuments.size()) {
+				// Mark extra existing records as inactive
+				existingDocuments.get(i).setIs_active(0);
+				empDocumentsRepository.save(existingDocuments.get(i));
+				logger.debug("Marked EmpDocuments[{}] as inactive for employee (emp_id: {})", i, empId);
+			}
+		}
+		logger.info("Updated/Created {} document records for employee (emp_id: {})", newDocuments.size(), empId);
+	}
+	
+	/**
+	 * Update or create Bank entities - overwrites existing records
+	 */
+	private void updateOrCreateBankEntities(List<BankDetails> newBanks, Employee employee) {
+		int empId = employee.getEmp_id();
+		List<BankDetails> existingBanks = bankDetailsRepository.findByEmpIdAndIsActive(empId, 1);
+		
+		int maxSize = Math.max(newBanks.size(), existingBanks.size());
+		for (int i = 0; i < maxSize; i++) {
+			if (i < newBanks.size()) {
+				BankDetails newBank = newBanks.get(i);
+				newBank.setEmpId(employee);
+				newBank.setIsActive(1);
+				
+				if (i < existingBanks.size()) {
+					// Update existing record
+					BankDetails existing = existingBanks.get(i);
+					updateBankFields(existing, newBank);
+					bankDetailsRepository.save(existing);
+					logger.debug("Updated existing BankDetails[{}] for employee (emp_id: {})", i, empId);
+				} else {
+					// Create new record
+					bankDetailsRepository.save(newBank);
+					logger.debug("Created new BankDetails[{}] for employee (emp_id: {})", i, empId);
+				}
+			} else if (i < existingBanks.size()) {
+				// Mark extra existing records as inactive
+				existingBanks.get(i).setIsActive(0);
+				bankDetailsRepository.save(existingBanks.get(i));
+				logger.debug("Marked BankDetails[{}] as inactive for employee (emp_id: {})", i, empId);
+			}
+		}
+		logger.info("Updated/Created {} bank records for employee (emp_id: {})", newBanks.size(), empId);
+	}
+	
+	/**
+	 * Helper methods to update entity fields
+	 */
+	private void updateAddressFields(EmpaddressInfo target, EmpaddressInfo source) {
+		target.setAddrs_type(source.getAddrs_type());
+		target.setCountry_id(source.getCountry_id());
+		target.setState_id(source.getState_id());
+		target.setCity_id(source.getCity_id());
+		target.setPostal_code(source.getPostal_code());
+		target.setHouse_no(source.getHouse_no());
+		target.setLandmark(source.getLandmark());
+		target.setIs_active(source.getIs_active());
+	}
+	
+	private void updateFamilyFields(EmpFamilyDetails target, EmpFamilyDetails source) {
+		target.setFirst_name(source.getFirst_name());
+		target.setLast_name(source.getLast_name());
+		target.setDate_of_birth(source.getDate_of_birth());
+		target.setGender_id(source.getGender_id());
+		target.setRelation_id(source.getRelation_id());
+		target.setBlood_group_id(source.getBlood_group_id());
+		target.setNationality(source.getNationality());
+		target.setOccupation(source.getOccupation());
+		target.setIs_dependent(source.getIs_dependent());
+		target.setIs_late(source.getIs_late());
+		target.setIs_sri_chaitanya_emp(source.getIs_sri_chaitanya_emp());
+		target.setParent_emp_id(source.getParent_emp_id()); // CRITICAL: Update parent_emp_id
+		target.setEmail(source.getEmail());
+		target.setContact_no(source.getContact_no());
+		target.setIs_active(source.getIs_active());
+	}
+	
+	private void updateExperienceFields(EmpExperienceDetails target, EmpExperienceDetails source) {
+		target.setPre_organigation_name(source.getPre_organigation_name());
+		target.setDate_of_join(source.getDate_of_join()); // CRITICAL: Update date_of_join
+		target.setDate_of_leave(source.getDate_of_leave()); // CRITICAL: Update date_of_leave
+		target.setDesignation(source.getDesignation());
+		target.setLeaving_reason(source.getLeaving_reason()); // CRITICAL: Update leaving_reason
+		target.setNature_of_duties(source.getNature_of_duties());
+		target.setCompany_addr(source.getCompany_addr());
+		target.setGross_salary(source.getGross_salary());
+		target.setPre_chaitanya_id(source.getPre_chaitanya_id());
+		target.setIs_active(source.getIs_active());
+	}
+	
+	private void updateQualificationFields(EmpQualification target, EmpQualification source) {
+		target.setQualification_id(source.getQualification_id());
+		target.setQualification_degree_id(source.getQualification_degree_id());
+		target.setUniversity(source.getUniversity());
+		target.setInstitute(source.getInstitute());
+		target.setPassedout_year(source.getPassedout_year());
+		target.setSpecialization(source.getSpecialization());
+		target.setIs_active(source.getIs_active());
+	}
+	
+	private void updateDocumentFields(EmpDocuments target, EmpDocuments source) {
+		target.setEmp_doc_type_id(source.getEmp_doc_type_id());
+		target.setDoc_path(source.getDoc_path());
+		target.setSsc_no(source.getSsc_no());
+		target.setIs_verified(source.getIs_verified());
+		target.setIs_active(source.getIs_active());
+	}
+	
+	private void updateBankFields(BankDetails target, BankDetails source) {
+		target.setEmpPaymentType(source.getEmpPaymentType());
+		target.setBankHolderName(source.getBankHolderName());
+		target.setAccNo(source.getAccNo());
+		target.setIfscCode(source.getIfscCode());
+		target.setNetPayable(source.getNetPayable());
+		target.setBankName(source.getBankName());
+		target.setBankBranch(source.getBankBranch());
+		target.setAccType(source.getAccType());
+		target.setBankStatementChequePath(source.getBankStatementChequePath()); // Update bank statement/cheque path
+		target.setIsActive(source.getIsActive());
+	}
+	
+	/**
+	 * Update existing employee entity with new data from BasicInfoDTO
+	 * Preserves emp_id and other fields that shouldn't be changed
+	 * 
+	 * @param employee Existing employee entity
+	 * @param basicInfo BasicInfoDTO with updated data
+	 */
+	private void updateEmployeeEntity(Employee employee, BasicInfoDTO basicInfo) {
+		if (basicInfo == null) {
+			return;
+		}
+		
+		logger.info("🔄 Updating employee entity (emp_id: {}) with new data", employee.getEmp_id());
+		
+		// Update basic fields
+		if (basicInfo.getFirstName() != null && !basicInfo.getFirstName().trim().isEmpty()) {
+			employee.setFirst_name(basicInfo.getFirstName());
+		}
+		if (basicInfo.getLastName() != null && !basicInfo.getLastName().trim().isEmpty()) {
+			employee.setLast_name(basicInfo.getLastName());
+		}
+		if (basicInfo.getDateOfJoin() != null) {
+			employee.setDate_of_join(basicInfo.getDateOfJoin());
+		}
+		if (basicInfo.getPrimaryMobileNo() != null && basicInfo.getPrimaryMobileNo() > 0) {
+			employee.setPrimary_mobile_no(basicInfo.getPrimaryMobileNo());
+		}
+		// Email is not set to Employee entity - it goes to EmpDetails.personal_email only
+		employee.setEmail(null);
+		
+		if (basicInfo.getTotalExperience() != null) {
+			employee.setTotal_experience(basicInfo.getTotalExperience().doubleValue());
+		}
+		
+		// Keep is_active and status as they are (don't reset)
+		// employee.setIs_active(1); // Keep existing value
+		// employee.setStatus("ACTIVE"); // Keep existing value
+		
+		// Update temp_payroll_id if provided (should already be set, but update anyway)
+		if (basicInfo.getTempPayrollId() != null && !basicInfo.getTempPayrollId().trim().isEmpty()) {
+			employee.setTemp_payroll_id(basicInfo.getTempPayrollId());
+		}
+		
+		// Update created_by if provided, otherwise keep existing
+		if (basicInfo.getCreatedBy() != null && basicInfo.getCreatedBy() > 0) {
+			employee.setCreated_by(basicInfo.getCreatedBy());
+		}
+		
+		// Update foreign key relationships
+		if (basicInfo.getCampusId() != null) {
+			employee.setCampus_id(campusRepository.findByCampusIdAndIsActive(basicInfo.getCampusId(), 1)
+					.orElseThrow(() -> new ResourceNotFoundException("Active Campus not found with ID: " + basicInfo.getCampusId())));
+		}
+		
+		if (basicInfo.getGenderId() != null) {
+			employee.setGender(genderRepository.findByIdAndIsActive(basicInfo.getGenderId(), 1)
+					.orElseThrow(() -> new ResourceNotFoundException("Active Gender not found")));
+		}
+		
+		if (basicInfo.getDesignationId() != null) {
+			employee.setDesignation(designationRepository.findByIdAndIsActive(basicInfo.getDesignationId(), 1)
+					.orElseThrow(() -> new ResourceNotFoundException("Active Designation not found")));
+		}
+		
+		if (basicInfo.getDepartmentId() != null) {
+			employee.setDepartment(departmentRepository.findByIdAndIsActive(basicInfo.getDepartmentId(), 1)
+					.orElseThrow(() -> new ResourceNotFoundException("Active Department not found")));
+		}
+		
+		if (basicInfo.getCategoryId() != null) {
+			employee.setCategory(categoryRepository.findByIdAndIsActive(basicInfo.getCategoryId(), 1)
+					.orElseThrow(() -> new ResourceNotFoundException("Active Category not found")));
+		}
+		
+		if (basicInfo.getEmpTypeId() != null) {
+			employee.setEmployee_type_id(employeeTypeRepository.findByIdAndIsActive(basicInfo.getEmpTypeId(), 1)
+					.orElseThrow(() -> new ResourceNotFoundException("Active EmployeeType not found")));
+		}
+		
+		if (basicInfo.getEmpWorkModeId() != null) {
+			employee.setWorkingMode_id(workingModeRepository.findByIdAndIsActive(basicInfo.getEmpWorkModeId(), 1)
+					.orElseThrow(() -> new ResourceNotFoundException("Active WorkingMode not found")));
+		}
+		
+		if (basicInfo.getJoinTypeId() != null) {
+			employee.setJoin_type_id(joiningAsRepository.findByIdAndIsActive(basicInfo.getJoinTypeId(), 1)
+					.orElseThrow(() -> new ResourceNotFoundException("Active JoiningAs not found")));
+			
+			// Handle replacement logic
+			if (basicInfo.getJoinTypeId() == 3) {
+				if (basicInfo.getReplacedByEmpId() == null || basicInfo.getReplacedByEmpId() <= 0) {
+					throw new ResourceNotFoundException(
+							"replacedByEmpId is required when joinTypeId is 3 (Replacement). Please provide a valid replacement employee ID.");
+				}
+				employee.setEmployee_replaceby_id(employeeRepository.findByIdAndIs_active(basicInfo.getReplacedByEmpId(), 0)
+						.orElseThrow(() -> new ResourceNotFoundException(
+								"Inactive Replacement Employee not found with ID: " + basicInfo.getReplacedByEmpId() + 
+								". Only inactive employees (is_active = 0) can be used as replacement.")));
+			} else if (basicInfo.getReplacedByEmpId() != null && basicInfo.getReplacedByEmpId() > 0) {
+				employee.setEmployee_replaceby_id(employeeRepository.findByIdAndIs_active(basicInfo.getReplacedByEmpId(), 0)
+						.orElse(null));
+			} else {
+				employee.setEmployee_replaceby_id(null);
+			}
+			
+			// Handle contract dates
+			if (basicInfo.getJoinTypeId() == 4) {
+				if (basicInfo.getContractStartDate() != null) {
+					employee.setContract_start_date(basicInfo.getContractStartDate());
+				} else if (basicInfo.getDateOfJoin() != null) {
+					employee.setContract_start_date(basicInfo.getDateOfJoin());
+				}
+				
+				if (basicInfo.getContractEndDate() != null) {
+					employee.setContract_end_date(basicInfo.getContractEndDate());
+				} else {
+					java.sql.Date startDate = basicInfo.getContractStartDate() != null ? 
+							basicInfo.getContractStartDate() : basicInfo.getDateOfJoin();
+					if (startDate != null) {
+						long oneYearInMillis = 365L * 24 * 60 * 60 * 1000;
+						java.util.Date endDateUtil = new java.util.Date(startDate.getTime() + oneYearInMillis);
+						employee.setContract_end_date(new java.sql.Date(endDateUtil.getTime()));
+					}
+				}
+			}
+		}
+		
+		if (basicInfo.getModeOfHiringId() != null) {
+			employee.setModeOfHiring_id(modeOfHiringRepository.findByIdAndIsActive(basicInfo.getModeOfHiringId(), 1)
+					.orElseThrow(() -> new ResourceNotFoundException("Active ModeOfHiring not found")));
+		}
+		
+		// Update reference employees
+		if (basicInfo.getReferenceEmpId() != null && basicInfo.getReferenceEmpId() > 0) {
+			employee.setEmployee_reference(employeeRepository.findByIdAndIs_active(basicInfo.getReferenceEmpId(), 1)
+					.orElseThrow(() -> new ResourceNotFoundException("Active Reference Employee not found with ID: " + basicInfo.getReferenceEmpId())));
+		}
+		
+		if (basicInfo.getHiredByEmpId() != null && basicInfo.getHiredByEmpId() > 0) {
+			employee.setEmployee_hired(employeeRepository.findByIdAndIs_active(basicInfo.getHiredByEmpId(), 1)
+					.orElseThrow(() -> new ResourceNotFoundException("Active Hired By Employee not found with ID: " + basicInfo.getHiredByEmpId())));
+		}
+		
+		if (basicInfo.getManagerId() != null && basicInfo.getManagerId() > 0) {
+			employee.setEmployee_manager_id(employeeRepository.findByIdAndIs_active(basicInfo.getManagerId(), 1)
+					.orElseThrow(() -> new ResourceNotFoundException("Active Manager not found with ID: " + basicInfo.getManagerId())));
+		}
+		
+		if (basicInfo.getReportingManagerId() != null && basicInfo.getReportingManagerId() > 0) {
+			employee.setEmployee_reporting_id(employeeRepository.findByIdAndIs_active(basicInfo.getReportingManagerId(), 1)
+					.orElseThrow(() -> new ResourceNotFoundException("Active Reporting Manager not found with ID: " + basicInfo.getReportingManagerId())));
+		}
+		
+		// Note: qualification_id will be set later from qualification tab's highest qualification
+		// Status update is handled in onboardEmployee method (Back to Campus -> Pending at DO)
+		
+		logger.info("✅ Completed updating employee entity (emp_id: {})", employee.getEmp_id());
+	}
 }
-
